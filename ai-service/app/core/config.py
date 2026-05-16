@@ -78,9 +78,9 @@ class Settings(BaseSettings):
     qdrant_collection_summaries: str = "meeting_summaries"
     qdrant_vector_size: int = 3072
 
-    # ── AWS S3 ────────────────────────────────
-    aws_access_key_id: str = Field(...)
-    aws_secret_access_key: str = Field(...)
+    # ── AWS S3 (optional — only needed if you flip on /export/s3) ──
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
     aws_region: str = "us-east-1"
     s3_bucket_artifacts: str = "garage-copilot-artifacts"
     s3_bucket_recordings: str = "garage-copilot-recordings"
