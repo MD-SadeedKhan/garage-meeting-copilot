@@ -271,6 +271,13 @@ class SessionAIOrchestrator:
                 # person just said". If the most recent speaker is the
                 # host, they're already mid-thought — let them finish.
                 last_speaker, last_text = _latest_speaker_line(transcript)
+                logger.info(
+                    "suggestion_loop_tick",
+                    session_id=self._session_id,
+                    last_speaker=last_speaker,
+                    last_text_snippet=(last_text or "")[:80],
+                    transcript_chars=len(transcript),
+                )
                 if last_speaker != "contact" or not last_text:
                     continue
 
@@ -280,6 +287,10 @@ class SessionAIOrchestrator:
                 # bust the dedupe).
                 contact_hash = _line_hash(last_text)
                 if contact_hash == self._last_suggestion_contact_hash:
+                    logger.info(
+                        "suggestion_loop_skip_dedupe",
+                        session_id=self._session_id,
+                    )
                     continue
                 self._last_suggestion_contact_hash = contact_hash
 
