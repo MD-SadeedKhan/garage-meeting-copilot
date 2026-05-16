@@ -155,7 +155,15 @@ class RedisStreamState:
         chunks = await self.get_transcript_chunks(session_id, -last_n, -1)
         lines = []
         for chunk in chunks:
-            speaker = chunk.get("speaker", "Speaker")
+            # Writer (deepgram_service.TranscriptChunkResult.to_dict)
+            # sets `speaker_label`; older callers wrote `speaker`.
+            # Accept both, default to "speaker" so prompts never see
+            # capitalised junk.
+            speaker = (
+                chunk.get("speaker_label")
+                or chunk.get("speaker")
+                or "speaker"
+            )
             text = chunk.get("text", "").strip()
             if text:
                 lines.append(f"{speaker}: {text}")

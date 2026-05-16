@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import time
 import uuid
@@ -55,7 +56,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins,
+    allow_origins=[o.strip() for o in settings.allowed_origins.split(",")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -162,6 +163,28 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+# ── Transcript helpers ────────────────────────────────────────────────────────
+
+def _has_contact_speech(transcript: str) -> bool:
+    """True iff at least one line in the recent transcript is from
+    the contact (i.e. not just the host monologuing into the void)."""
+    for line in transcript.splitlines():
+        stripped = line.strip().lower()
+        if stripped.startswith("contact:") or stripped.startswith("[contact]"):
+            return True
+    return False
+
+
+def _tx_hash(transcript: str) -> str:
+    """Cheap content hash of the recent-transcript snapshot. Used as
+    a per-loop dedupe key so we don't spend an LLM call when nothing
+    new has been transcribed since last fire."""
+    # Trim each line to drop noise from whitespace shifts; md5 is
+    # plenty for an identity check (no security implication).
+    normalized = "\n".join(line.strip() for line in transcript.splitlines() if line.strip())
+    return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+
 # ── Background AI Tasks ───────────────────────────────────────────────────────
 
 class SessionAIOrchestrator:
@@ -188,6 +211,13 @@ class SessionAIOrchestrator:
         self._tasks: list[asyncio.Task[None]] = []
         self._last_summary_chunk_count = 0
         self._last_action_item_chunk_count = 0
+        # Per-loop hash of the last transcript snapshot we already
+        # spent an LLM call on. If the transcript hasn't changed
+        # since, the loop skips this tick. Saves $$ and stops the
+        # model from re-emitting the same suggestion every 4s.
+        self._last_suggestion_tx_hash: str | None = None
+        self._last_summary_tx_hash: str | None = None
+        self._last_action_items_tx_hash: str | None = None
 
     async def start(self) -> None:
         self._running = True
@@ -218,6 +248,21 @@ class SessionAIOrchestrator:
                 if not transcript.strip():
                     continue
 
+                # Only fire when the OTHER side has spoken. If the
+                # transcript so far is just the host monologuing, there
+                # is nothing to react to — we'd otherwise answer the
+                # host's own questions back to themselves.
+                if not _has_contact_speech(transcript):
+                    continue
+
+                # Global dedupe: if the transcript snapshot is bit-for-bit
+                # identical to the one we already spent an LLM call on,
+                # skip. Catches host-only ticks AND verbatim repeats.
+                tx_hash = _tx_hash(transcript)
+                if tx_hash == self._last_suggestion_tx_hash:
+                    continue
+                self._last_suggestion_tx_hash = tx_hash
+
                 screen_ctx = ""
                 cached_screen = await self._redis.get_cached_suggestion(
                     f"screen:{self._session_id}"
@@ -225,10 +270,26 @@ class SessionAIOrchestrator:
                 if cached_screen:
                     screen_ctx = cached_screen.get("text", "")
 
+                # Pull the everything-so-far rolling summary + the
+                # meeting metadata so the suggestion pipeline sees the
+                # FULL arc of the call, not just the last 30 lines.
+                rolling_summary = ""
+                cached_summary = await self._redis.get_cached_suggestion(
+                    f"summary:{self._session_id}"
+                )
+                if cached_summary:
+                    rolling_summary = cached_summary.get("content", "")
+
+                meeting_context = await self._redis.get_cached_suggestion(
+                    f"meeting_ctx:{self._session_id}"
+                ) or {}
+
                 suggestions = await _suggestion_pipeline.generate(
                     session_id=self._session_id,
                     recent_transcript=transcript,
                     screen_context=screen_ctx,
+                    rolling_summary=rolling_summary,
+                    meeting_context=meeting_context,
                 )
 
                 if suggestions:
@@ -262,6 +323,13 @@ class SessionAIOrchestrator:
                 )
                 if not transcript.strip():
                     continue
+
+                # Dedupe — don't regenerate the summary if the
+                # transcript hasn't changed since last run.
+                tx_hash = _tx_hash(transcript)
+                if tx_hash == self._last_summary_tx_hash:
+                    continue
+                self._last_summary_tx_hash = tx_hash
 
                 # Get previous summary from Redis cache
                 prev_data = await self._redis.get_cached_suggestion(
@@ -316,6 +384,19 @@ class SessionAIOrchestrator:
                 )
                 if not transcript.strip():
                     continue
+
+                # Action items require at least one back-and-forth.
+                # If only the host has spoken, there are no agreed
+                # commitments yet — skip to avoid hallucinating tasks
+                # out of monologue audio.
+                if not _has_contact_speech(transcript):
+                    continue
+
+                # Dedupe — skip if transcript snapshot is unchanged.
+                tx_hash = _tx_hash(transcript)
+                if tx_hash == self._last_action_items_tx_hash:
+                    continue
+                self._last_action_items_tx_hash = tx_hash
 
                 items = await _summary_pipeline.extract_action_items(
                     session_id=self._session_id,
@@ -404,7 +485,7 @@ async def redis_transcript_broadcaster(session_id: str) -> None:
 @app.websocket("/ws/copilot")
 async def copilot_websocket(
     websocket: WebSocket,
-    token: str = Query(default="dev-token"),  # Optional for development
+    token: str = Query(..., description="Garage JWT"),
     session_id: str = Query(..., description="Copilot session ID"),
 ):
     """
@@ -425,43 +506,34 @@ async def copilot_websocket(
       {"event": "chat_complete", ...}
       {"event": "error", ...}
     """
-    # Development: skip JWT validation, use session_id as user_id
-    auth_context = GarageAuthContext(
-        user_id=f"user_{session_id[:8]}",
-        organization_id="dev-org",
-        workspace_id="dev-workspace",
-        email="dev@test.local",
-        roles=["member"],
-        raw_token=token,
-    )
+    # Validate JWT for this WebSocket connection
+    try:
+        auth_context = await extract_ws_token(token)
+    except HTTPException:
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
 
-    # Rate limit: max N concurrent WS connections per user
     redis = get_redis()
     redis_state = RedisStreamState(redis)
 
-    # allowed, count = await redis_state.check_rate_limit(
-    #     f"ws:{auth_context.user_id}",
-    #     limit=settings.rate_limit_ws_connections_per_user,
-    #     window_seconds=300,
-    # )
-    # if not allowed:
-    #     await websocket.close(code=4029, reason="Too many connections")
-    #     return
+    # Rate limit: max N concurrent WS connections per user
+    allowed, _count = await redis_state.check_rate_limit(
+        f"ws:{auth_context.user_id}",
+        limit=settings.rate_limit_ws_connections_per_user,
+        window_seconds=300,
+    )
+    if not allowed:
+        await websocket.close(code=4029, reason="Too many connections")
+        return
+
+    # Validate session exists in Redis
+    session_data = await redis_state.get_session(session_id)
+    if not session_data:
+        await websocket.close(code=4004, reason="Session not found")
+        return
 
     # Connect WebSocket
     await manager.connect(websocket, session_id, auth_context.user_id)
-
-    # Validate session exists in Redis (DEVELOPMENT: skip)
-    # session_data = await redis_state.get_session(session_id)
-    # if not session_data:
-    #     await websocket.send_json(
-    #         {"event": "error", "code": "SESSION_NOT_FOUND", "message": "Session not found", "recoverable": False}
-    #     )
-    #     await websocket.close(code=4004, reason="Session not found")
-    #     manager.disconnect(websocket)
-    #     return
-
-    session_data = {"meeting_id": f"meeting_{session_id[:8]}"}
 
     garage_meeting_id = session_data.get("meeting_id", "")
     organization_id = auth_context.organization_id
@@ -485,11 +557,32 @@ async def copilot_websocket(
                 _persist_transcript_chunk(chunk, session_id)
             )
 
-    dg_service = await deepgram_manager.create_session(
+    # Open one Deepgram stream per audio source (host mic vs the
+    # remote-track mix). Each gets a forced speaker label so the
+    # LLM sees `[host] ...` and `[contact] ...` lines instead of
+    # Deepgram's anonymous "Speaker N".
+    dg_self = await deepgram_manager.create_session(
         session_id=session_id,
         redis_state=redis_state,
         on_transcript=on_transcript_chunk,
+        source="self",
     )
+    dg_others = await deepgram_manager.create_session(
+        session_id=session_id,
+        redis_state=redis_state,
+        on_transcript=on_transcript_chunk,
+        source="others",
+    )
+    # Legacy "mixed" fallback for any client that hasn't been
+    # updated to the dual-stream protocol — routes to a single
+    # diarized stream with no forced label.
+    dg_mixed = await deepgram_manager.create_session(
+        session_id=session_id,
+        redis_state=redis_state,
+        on_transcript=on_transcript_chunk,
+        source="mixed",
+    )
+    dg_by_source = {"self": dg_self, "others": dg_others, "mixed": dg_mixed}
 
     # Start per-session AI orchestrator (idempotent)
     if session_id not in _orchestrators:
@@ -524,13 +617,23 @@ async def copilot_websocket(
             msg_type = message.get("type")
 
             if msg_type == "audio":
-                # Decode and forward to Deepgram
+                # Decode and forward to the correct per-source
+                # Deepgram stream so the resulting transcript carries
+                # a known `host` / `contact` label.
                 try:
                     audio_bytes = base64.b64decode(message["data"])
                     sequence = message.get("sequence", 0)
+                    source = message.get("source", "mixed")
+                    if source not in dg_by_source:
+                        source = "mixed"
                     if sequence % 50 == 0:  # Log every 50 chunks
-                        logger.info("📦 Received audio chunk #%d (%d bytes)", sequence, len(audio_bytes))
-                    await dg_service.send_audio(audio_bytes)
+                        logger.info(
+                            "📦 Received audio chunk #%d (%d bytes) source=%s",
+                            sequence,
+                            len(audio_bytes),
+                            source,
+                        )
+                    await dg_by_source[source].send_audio(audio_bytes)
                 except Exception as e:
                     logger.warning("audio_decode_error", error=str(e))
 

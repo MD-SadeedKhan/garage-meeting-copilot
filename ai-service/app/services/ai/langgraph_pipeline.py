@@ -66,29 +66,49 @@ into an enterprise meeting platform. You have access to:
 - Screen context from the user's desktop
 - Semantic memory from this meeting and past meetings
 
+SPEAKER LABELS — IMPORTANT:
+- Lines tagged `host:` are what THE USER YOU ARE COACHING said.
+- Lines tagged `contact:` are what the OTHER PARTICIPANTS said.
+- Never confuse the two. "You said X" must reference a `host:` line.
+
 Your responses must be:
 - Concise and actionable
 - Grounded in the provided transcript context
 - Contextually aware of the meeting flow
 - Professional and enterprise-appropriate
 
-When referencing transcript content, cite the speaker.
+When referencing transcript content, cite the speaker (host or contact).
 When you don't have enough context, say so clearly."""
 
 SYSTEM_PROMPT_SUGGESTIONS = """\
-You are a real-time AI copilot listening to a live meeting or conversation. \
-Your job is to help the USER (the one wearing the earpiece / reading this overlay) \
-respond well, sound informed, and stay sharp — like having an expert whispering in their ear.
+You are a real-time AI sales/conversation copilot whispering into the host's \
+ear during a LIVE call. Your only job: every time the contact says something, \
+hand the host 2–4 ready-to-speak next lines they could use right now.
 
-Analyze the last thing said and generate 2-4 IMMEDIATELY USABLE suggestions.
+CONTEXT YOU RECEIVE PER TURN (in this order):
+1. MEETING METADATA — who the host is, who's on the other side, what org they're from.
+2. PRIOR SUMMARY — a rolling summary of everything that happened earlier in this call. Use it. Reference commitments, objections, names, numbers, anything established earlier.
+3. RECENT EXCHANGE — the last ~30 lines verbatim, with speaker labels.
+
+SPEAKER LABELS in the transcript:
+- `host:` = THE USER you are coaching. These are the words THEY spoke — do NOT suggest they repeat themselves.
+- `contact:` = the OTHER participant(s). Suggestions are reactions to what `contact` just said.
+- Anchor every suggestion on the MOST RECENT `contact:` line unless the host explicitly invited a follow-up on their own point.
+- If the transcript contains ONLY `host:` lines (the contact hasn't spoken yet), return `{"suggestions": []}` — DO NOT invent a contact utterance and respond to it. The host is talking; wait for the other side.
+
+YOUR TASK on each fire:
+1. Read the metadata + summary so you actually know what this call is about.
+2. Read the latest contact utterance.
+3. Decide if a useful next line exists. If yes, emit 2–4 suggestions. If no (small talk, filler, "uh huh"), emit `{"suggestions": []}`.
+4. Each suggestion is written AS THE HOST WOULD SAY IT — first-person, conversational, ready to speak verbatim.
 
 Rules:
-- Write suggestions AS IF the user will say them out loud RIGHT NOW
-- Be direct, concrete, and conversational — no fluff
-- Surface relevant facts, stats, or context the user might not know
-- Help the user handle objections, answer questions, or add value
-- Never ask meta-questions like "what do they mean?" — just infer and respond
-- Keep each suggestion under 2 sentences
+- Be direct, concrete, conversational. No fluff. No "you could say something like…".
+- Surface concrete facts/numbers/commitments that the host might forget — pull from the prior summary.
+- Help the host handle objections, answer questions, or add value.
+- Never ask meta-questions like "what do they mean?" — infer and answer.
+- Each suggestion ≤ 2 sentences.
+- Tie `context_excerpt` to the EXACT contact line you're reacting to.
 
 Suggestion types:
 - "answer": A direct answer the user can give to a question just asked
@@ -111,6 +131,12 @@ Output ONLY valid JSON:
 
 SYSTEM_PROMPT_SUMMARY = """\
 You are generating a rolling executive summary of a live meeting.
+
+SPEAKER LABELS in the transcript:
+- `host:` = the user we are coaching.
+- `contact:` = the other participant(s).
+Use those roles when attributing positions or commitments.
+
 Produce a structured summary with:
 1. Key topics discussed (bullet points)
 2. Decisions made
@@ -143,6 +169,47 @@ Output ONLY valid JSON:
     }
   ]
 }"""
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _format_meeting_metadata(ctx: dict[str, Any]) -> str:
+    """Render the meeting-context dict (as returned by the
+    contacts-backend `/api/v1/meeting-context/:roomName` endpoint)
+    into a short prompt-friendly block. Resilient to missing keys —
+    only emits fields it actually has."""
+    lines: list[str] = []
+    meeting = ctx.get("meeting") or {}
+    host = ctx.get("host") or {}
+    org = ctx.get("organization") or {}
+
+    title = meeting.get("title") or "Live meeting"
+    lines.append(f"- Meeting: {title}")
+    if meeting.get("startedAt"):
+        lines.append(f"- Started at: {meeting['startedAt']}")
+
+    host_bits: list[str] = []
+    if host.get("name"):
+        host_bits.append(host["name"])
+    if host.get("email"):
+        host_bits.append(f"<{host['email']}>")
+    if host_bits:
+        lines.append(f"- Host (the user you are coaching): {' '.join(host_bits)}")
+
+    if org.get("name") or org.get("id"):
+        lines.append(f"- Host organization: {org.get('name') or org.get('id')}")
+
+    if ctx.get("contact"):
+        c = ctx["contact"]
+        cb: list[str] = []
+        if c.get("name"):
+            cb.append(c["name"])
+        if c.get("email"):
+            cb.append(f"<{c['email']}>")
+        if cb:
+            lines.append(f"- Known contact on the other side: {' '.join(cb)}")
+
+    return "\n".join(lines)
 
 
 # ── Graph Nodes ───────────────────────────────────────────────────────────────
@@ -373,14 +440,39 @@ class SuggestionPipeline:
         session_id: str,
         recent_transcript: str,
         screen_context: str = "",
+        rolling_summary: str = "",
+        meeting_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Generate contextual suggestions from recent transcript."""
+        """Generate contextual suggestions from recent transcript.
+
+        `rolling_summary` is the everything-so-far summary cached by
+        the summary loop; passing it gives the LLM the FULL arc of the
+        call without us having to ship the entire transcript on every
+        4-second tick. `meeting_context` is the dict cached from
+        `workspace_context_engine.get_meeting_context(roomName)` —
+        we surface the host/contact/org bits so the model knows whom
+        it is coaching.
+        """
         if not recent_transcript.strip():
             return []
 
-        context_parts = [f"Meeting Transcript:\n{recent_transcript}"]
+        context_parts: list[str] = []
+
+        if meeting_context:
+            meta_lines = _format_meeting_metadata(meeting_context)
+            if meta_lines:
+                context_parts.append(f"# MEETING METADATA\n{meta_lines}")
+
+        if rolling_summary.strip():
+            context_parts.append(
+                f"# PRIOR SUMMARY (everything before the recent exchange)\n{rolling_summary.strip()}"
+            )
+
+        context_parts.append(
+            f"# RECENT EXCHANGE (verbatim, with speaker labels)\n{recent_transcript}"
+        )
         if screen_context:
-            context_parts.append(f"Screen Context:\n{screen_context}")
+            context_parts.append(f"# SCREEN CONTEXT\n{screen_context}")
 
         messages = [
             SystemMessage(content=SYSTEM_PROMPT_SUGGESTIONS),

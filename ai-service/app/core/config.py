@@ -26,10 +26,11 @@ class Settings(BaseSettings):
     secret_key: str = Field(..., min_length=32)
 
     # ── Garage Ecosystem Integration ──────────
-    garage_api_base_url: AnyHttpUrl = Field(...)
+    garage_api_base_url: AnyHttpUrl | None = None
+    contacts_backend_base_url: str = "http://host.docker.internal:8080"
     garage_jwt_secret: str = Field(..., min_length=16)
     garage_jwt_algorithm: str = "HS256"
-    garage_jwt_audience: str = "garage-platform"
+    garage_jwt_audience: str | None = None
 
     # ── Server ────────────────────────────────
     ai_service_host: str = "0.0.0.0"
@@ -37,7 +38,7 @@ class Settings(BaseSettings):
     realtime_gateway_port: int = 8001
 
     # ── CORS ──────────────────────────────────
-    allowed_origins: str = "http://localhost:1420"
+    allowed_origins: str = "http://localhost:3000"
 
     @field_validator("allowed_origins", mode="before")
     @classmethod

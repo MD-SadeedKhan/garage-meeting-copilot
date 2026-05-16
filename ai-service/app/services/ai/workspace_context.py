@@ -32,35 +32,10 @@ class WorkspaceContextEngine:
         use_cache: bool = True,
     ) -> dict[str, Any]:
         """
-        Retrieve workspace context, using Redis cache when available.
-        Falls back gracefully if Garage API is unreachable.
+        No-op: workspace context is no longer fetched separately.
+        Retained to avoid breaking callers.
         """
-        if not workspace_id:
-            return {}
-
-        redis_state = RedisStreamState(get_redis())
-        cache_key = f"workspace_ctx:{workspace_id}"
-
-        # Try cache first
-        if use_cache:
-            cached = await redis_state.get_cached_suggestion(cache_key)
-            if cached:
-                logger.debug("workspace_context_cache_hit", workspace_id=workspace_id)
-                return cached
-
-        # Fetch from Garage API
-        try:
-            context = await self._client.get_workspace_context(workspace_id, token)
-            # Cache the result
-            await redis_state.cache_suggestion(cache_key, context, ttl=WORKSPACE_CONTEXT_TTL)
-            return context
-        except Exception as e:
-            logger.warning(
-                "workspace_context_fetch_failed",
-                workspace_id=workspace_id,
-                error=str(e),
-            )
-            return {}
+        return {}
 
     async def get_meeting_context(
         self,

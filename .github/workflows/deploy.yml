@@ -1,0 +1,111 @@
+name: Build & Deploy meeting-copilot
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # Override per-environment if you ever co-host or migrate. The
+  # secret is the public IPv4 of the meeting-copilot droplet.
+  DEPLOY_HOST: ${{ secrets.COPILOT_DEPLOY_HOST }}
+  DEPLOY_PATH: /opt/copilot
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      image_backend: ${{ steps.meta.outputs.image_backend }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag + lowercase image name
+        id: meta
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "image_backend=ghcr.io/${OWNER_LC}/meeting-copilot-ai-service" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push ai-service image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./ai-service
+          file: ./ai-service/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_backend }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.image_backend }}:latest
+          cache-from: type=gha,scope=meeting-copilot
+          cache-to: type=gha,scope=meeting-copilot,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ env.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync compose + nginx vhost to host
+        run: |
+          ssh root@${{ env.DEPLOY_HOST }} "mkdir -p ${{ env.DEPLOY_PATH }}"
+          rsync -az \
+            docker-compose.deploy.yml \
+            root@${{ env.DEPLOY_HOST }}:${{ env.DEPLOY_PATH }}/docker-compose.deploy.yml
+          rsync -az \
+            nginx/copilot.networkchains.com.conf \
+            root@${{ env.DEPLOY_HOST }}:/etc/nginx/sites-available/copilot.networkchains.com.conf
+
+      - name: Pull image, run alembic, restart services
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.tag }}
+          IMAGE_BACKEND: ${{ needs.build.outputs.image_backend }}
+        run: |
+          ssh root@${{ env.DEPLOY_HOST }} "
+            set -e
+            cd ${{ env.DEPLOY_PATH }}
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Persist the image refs alongside .env so 'docker compose'
+            # invocations on the host (without env passthrough) keep
+            # working.
+            cat > .env.image <<EOF
+          IMAGE_TAG=${IMAGE_TAG}
+          IMAGE_BACKEND=${IMAGE_BACKEND}
+          EOF
+
+            docker compose --env-file .env --env-file .env.image -f docker-compose.deploy.yml pull
+            docker compose --env-file .env --env-file .env.image -f docker-compose.deploy.yml up -d
+
+            # Apply any new Alembic migrations once the service is up.
+            # Idempotent — no-op when at head.
+            docker compose --env-file .env --env-file .env.image -f docker-compose.deploy.yml \
+              exec -T meeting-ai-service alembic upgrade head
+
+            docker image prune -f
+
+            # Make sure nginx picks up any vhost edits we just synced.
+            ln -sf /etc/nginx/sites-available/copilot.networkchains.com.conf \
+                   /etc/nginx/sites-enabled/copilot.networkchains.com.conf
+            nginx -t && systemctl reload nginx
+          "

@@ -4,6 +4,7 @@ Includes all routers, middleware, and lifespan management.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from contextlib import asynccontextmanager
 
@@ -38,6 +39,7 @@ from app.schemas.copilot import (
     TranscriptChunkSchema,
 )
 from app.services.ai.langgraph_pipeline import SuggestionPipeline
+from app.services.ai.workspace_context import workspace_context_engine
 from app.services.memory.qdrant_retriever import qdrant_retriever
 from app.services.ocr.screen_ocr import screen_ocr_pipeline
 from app.gateway import copilot_websocket
@@ -74,7 +76,7 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins,
+    allow_origins=[o.strip() for o in settings.allowed_origins.split(",")],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
@@ -178,6 +180,22 @@ async def create_session(
         session_id=session.id,
         garage_meeting_id=body.garage_meeting_id,
         user_id=auth.user_id,
+    )
+
+    # Fire-and-forget: prefetch meeting context from contacts-backend and
+    # cache under meeting_ctx:{session_id} so pipelines can read it.
+    async def _prefetch_meeting_ctx(session_id: str, room_name: str, token: str) -> None:
+        try:
+            ctx = await workspace_context_engine.get_meeting_context(room_name, token)
+            if ctx:
+                await redis_state.cache_suggestion(
+                    f"meeting_ctx:{session_id}", ctx, ttl=3600
+                )
+        except Exception as e:
+            logger.warning("meeting_ctx_prefetch_failed", error=str(e))
+
+    asyncio.create_task(
+        _prefetch_meeting_ctx(session.id, body.garage_meeting_id, auth.raw_token)
     )
 
     return SessionResponse.model_validate(session)

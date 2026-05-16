@@ -1,6 +1,6 @@
 """
 Garage Meeting Copilot — JWT Integration Middleware
-Validates Garage-issued JWTs and injects user context.
+Validates contacts-backend issued JWTs and injects user context.
 """
 from __future__ import annotations
 
@@ -54,8 +54,8 @@ class GarageAuthContext:
 
 class GarageJWTValidator:
     """
-    Validates JWTs issued by the Garage authentication system.
-    Supports both local secret validation and Garage JWKS endpoint.
+    Validates JWTs issued by the contacts-backend authentication system.
+    HS256 with no audience claim; claims: {userId, orgId, role?, name?, email?}.
     """
 
     def __init__(self) -> None:
@@ -66,9 +66,8 @@ class GarageJWTValidator:
             payload = jwt.decode(
                 token,
                 self._settings.garage_jwt_secret,
-                algorithms=[self._settings.garage_jwt_algorithm],
-                audience=self._settings.garage_jwt_audience,
-                options={"verify_exp": True},
+                algorithms=["HS256"],
+                options={"verify_exp": True, "verify_aud": False},
             )
             return payload
         except JWTError as e:
@@ -82,19 +81,23 @@ class GarageJWTValidator:
     def extract_context(self, token: str) -> GarageAuthContext:
         payload = self.decode_token(token)
 
-        user_id = payload.get("sub")
+        user_id = payload.get("userId")
         if not user_id:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token missing subject claim",
+                detail="Token missing userId claim",
             )
+
+        org_id = payload.get("orgId", "")
+        role = payload.get("role")
+        roles = [role] if role else []
 
         return GarageAuthContext(
             user_id=user_id,
-            organization_id=payload.get("org") or payload.get("org_id", ""),
-            workspace_id=payload.get("workspace") or payload.get("workspace_id"),
+            organization_id=org_id,
+            workspace_id=None,
             email=payload.get("email", ""),
-            roles=payload.get("roles", []),
+            roles=roles,
             raw_token=token,
         )
 
@@ -144,23 +147,23 @@ async def extract_ws_token(token: str) -> GarageAuthContext:
 
 class GarageAPIClient:
     """
-    HTTP client for fetching context from Garage ecosystem APIs.
+    HTTP client for fetching meeting context from the contacts-backend.
     Uses the validated user JWT for authenticated requests.
     """
 
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._base_url = str(self._settings.garage_api_base_url).rstrip("/")
+        self._base_url = str(self._settings.contacts_backend_base_url).rstrip("/")
 
     async def get_meeting_context(
         self,
-        meeting_id: str,
+        room_name: str,
         token: str,
     ) -> dict[str, Any]:
-        """Fetch meeting metadata from Garage API."""
+        """Fetch meeting context (meeting/organization/host) from contacts-backend."""
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                f"{self._base_url}/api/v1/meetings/{meeting_id}",
+                f"{self._base_url}/api/v1/meeting-context/{room_name}",
                 headers={"Authorization": f"Bearer {token}"},
             )
             resp.raise_for_status()
@@ -171,25 +174,13 @@ class GarageAPIClient:
         workspace_id: str,
         token: str,
     ) -> dict[str, Any]:
-        """Fetch workspace metadata from Garage API."""
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{self._base_url}/api/v1/workspaces/{workspace_id}",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        """Deprecated no-op — workspace context no longer separately fetched."""
+        return {}
 
     async def get_user_profile(
         self,
         user_id: str,
         token: str,
     ) -> dict[str, Any]:
-        """Fetch user profile from Garage API."""
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                f"{self._base_url}/api/v1/users/{user_id}",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        """Deprecated no-op — user profile no longer separately fetched."""
+        return {}

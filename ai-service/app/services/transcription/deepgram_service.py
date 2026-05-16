@@ -91,6 +91,9 @@ class DeepgramStreamingService:
         session_id: str,
         redis_state: RedisStreamState,
         on_transcript: Any,  # Callable[[TranscriptChunkResult], Awaitable[None]]
+        *,
+        source: str = "mixed",
+        forced_speaker_label: str | None = None,
     ) -> None:
         self._session_id = session_id
         self._redis = redis_state
@@ -101,6 +104,11 @@ class DeepgramStreamingService:
         self._audio_queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=512)
         self._running = False
         self._client: DeepgramClient | None = None
+        # Used to label transcripts so the LLM can tell "what the
+        # host said" vs "what the contact said". When set, we ignore
+        # Deepgram's anonymous diarization output for this stream.
+        self._source = source
+        self._forced_speaker_label = forced_speaker_label
 
     async def start(self) -> None:
         """Initialise Deepgram client and open live connection."""
@@ -200,12 +208,18 @@ class DeepgramStreamingService:
             is_final = result.is_final
             self._sequence += 1
 
-            # Extract speaker from diarization
-            speaker_label: str | None = None
+            # If we know which side this stream came from (host mic
+            # vs remote LiveKit tracks), label it explicitly. That
+            # beats Deepgram's anonymous "Speaker N" diarization which
+            # the LLM can't map back to a real identity.
             words = alt.words or []
-            if words and hasattr(words[0], "speaker"):
+            if self._forced_speaker_label:
+                speaker_label: str | None = self._forced_speaker_label
+            elif words and hasattr(words[0], "speaker"):
                 speaker_num = words[0].speaker
                 speaker_label = f"Speaker {speaker_num + 1}"
+            else:
+                speaker_label = None
 
             start_time = result.start or 0.0
             duration = result.duration or 0.0
@@ -302,58 +316,89 @@ class DeepgramSessionManager:
     """
 
     def __init__(self) -> None:
-        self._sessions: dict[str, DeepgramStreamingService] = {}
-        self._tasks: dict[str, asyncio.Task[None]] = {}
+        # Keyed by (copilot_session_id, source) so the host mic and
+        # the remote-mix get independent Deepgram streams. Backwards-
+        # compatible: legacy callers without a source land in the
+        # "mixed" bucket.
+        self._sessions: dict[tuple[str, str], DeepgramStreamingService] = {}
+        self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+
+    @staticmethod
+    def _label_for_source(source: str) -> str | None:
+        if source == "self":
+            return "host"
+        if source == "others":
+            return "contact"
+        return None
 
     async def create_session(
         self,
         session_id: str,
         redis_state: RedisStreamState,
         on_transcript: Any,
+        *,
+        source: str = "mixed",
     ) -> DeepgramStreamingService:
-        if session_id in self._sessions:
-            return self._sessions[session_id]
+        key = (session_id, source)
+        if key in self._sessions:
+            return self._sessions[key]
 
         service = DeepgramStreamingService(
             session_id=session_id,
             redis_state=redis_state,
             on_transcript=on_transcript,
+            source=source,
+            forced_speaker_label=self._label_for_source(source),
         )
         await service.start()
 
         # Run the send loop as a background task
         task = asyncio.create_task(service.run_send_loop())
-        self._tasks[session_id] = task
-        self._sessions[session_id] = service
+        self._tasks[key] = task
+        self._sessions[key] = service
 
-        logger.info("deepgram_session_created", session_id=session_id)
+        logger.info(
+            "deepgram_session_created",
+            session_id=session_id,
+            source=source,
+        )
         return service
 
     async def get_session(
         self,
         session_id: str,
+        source: str = "mixed",
     ) -> DeepgramStreamingService | None:
-        return self._sessions.get(session_id)
+        return self._sessions.get((session_id, source))
 
     async def end_session(self, session_id: str) -> None:
-        service = self._sessions.pop(session_id, None)
-        if service:
-            await service.stop()
+        """End every Deepgram stream attached to this copilot session,
+        regardless of source."""
+        keys = [k for k in self._sessions if k[0] == session_id]
+        for key in keys:
+            service = self._sessions.pop(key, None)
+            if service:
+                await service.stop()
 
-        task = self._tasks.pop(session_id, None)
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            task = self._tasks.pop(key, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-        logger.info("deepgram_session_ended", session_id=session_id)
+            logger.info(
+                "deepgram_session_ended",
+                session_id=session_id,
+                source=key[1],
+            )
 
     async def shutdown(self) -> None:
         """Gracefully terminate all active sessions."""
-        for session_id in list(self._sessions.keys()):
-            await self.end_session(session_id)
+        # Snapshot then end-by-session_id (which clears every source).
+        for sid in {k[0] for k in list(self._sessions.keys())}:
+            await self.end_session(sid)
 
 
 # Module-level singleton
