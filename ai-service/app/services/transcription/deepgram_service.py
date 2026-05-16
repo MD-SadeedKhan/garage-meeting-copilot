@@ -248,11 +248,18 @@ class DeepgramStreamingService:
                 ],
             )
 
-            # Buffer in Redis immediately
-            await self._redis.append_transcript_chunk(
-                self._session_id,
-                chunk.to_dict(),
-            )
+            # Buffer in Redis only on FINAL results. Interim results
+            # are partial guesses that mutate every ~200ms ("Hi" →
+            # "Hi there" → "Hi there how are you?") — appending them
+            # all bloats the transcript with near-duplicates and
+            # breaks any "did the contact just say something new?"
+            # dedupe downstream. The live WS broadcast below still
+            # gets interims so the FE can render live captions.
+            if is_final:
+                await self._redis.append_transcript_chunk(
+                    self._session_id,
+                    chunk.to_dict(),
+                )
 
             # Publish to session channel for WebSocket broadcast
             await self._redis.publish(

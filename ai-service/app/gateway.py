@@ -165,24 +165,40 @@ manager = ConnectionManager()
 
 # ── Transcript helpers ────────────────────────────────────────────────────────
 
-def _has_contact_speech(transcript: str) -> bool:
-    """True iff at least one line in the recent transcript is from
-    the contact (i.e. not just the host monologuing into the void)."""
-    for line in transcript.splitlines():
-        stripped = line.strip().lower()
-        if stripped.startswith("contact:") or stripped.startswith("[contact]"):
-            return True
-    return False
+def _latest_speaker_line(transcript: str) -> tuple[str | None, str | None]:
+    """Return (speaker, text) of the most recent non-empty line in
+    the transcript, or (None, None) if empty. Speaker is
+    lower-cased; supports both `speaker: text` and `[speaker] text`
+    formats."""
+    for raw in reversed(transcript.splitlines()):
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith("[") and "]" in s:
+            head = s[1:s.index("]")].strip().lower()
+            tail = s[s.index("]") + 1:].lstrip(": ").strip()
+            return head, tail
+        if ":" in s:
+            head, _, tail = s.partition(":")
+            return head.strip().lower(), tail.strip()
+        return None, s
+    return None, None
 
 
 def _tx_hash(transcript: str) -> str:
     """Cheap content hash of the recent-transcript snapshot. Used as
     a per-loop dedupe key so we don't spend an LLM call when nothing
-    new has been transcribed since last fire."""
-    # Trim each line to drop noise from whitespace shifts; md5 is
-    # plenty for an identity check (no security implication).
+    new has been transcribed since last fire. Whitespace-normalised
+    so trivial differences don't bust the hash."""
     normalized = "\n".join(line.strip() for line in transcript.splitlines() if line.strip())
     return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+
+def _line_hash(text: str) -> str:
+    """Hash of a single utterance, used to detect 'same contact line
+    we already responded to' independent of what the host added
+    afterwards."""
+    return hashlib.md5(text.strip().lower().encode("utf-8")).hexdigest()
 
 
 # ── Background AI Tasks ───────────────────────────────────────────────────────
@@ -211,11 +227,13 @@ class SessionAIOrchestrator:
         self._tasks: list[asyncio.Task[None]] = []
         self._last_summary_chunk_count = 0
         self._last_action_item_chunk_count = 0
-        # Per-loop hash of the last transcript snapshot we already
-        # spent an LLM call on. If the transcript hasn't changed
-        # since, the loop skips this tick. Saves $$ and stops the
-        # model from re-emitting the same suggestion every 4s.
-        self._last_suggestion_tx_hash: str | None = None
+        # Suggestion loop dedupes on the *last contact utterance* —
+        # adding host filler after a contact line shouldn't re-fire,
+        # but a NEW contact utterance should.
+        self._last_suggestion_contact_hash: str | None = None
+        # Summary + action-items dedupe on the whole transcript
+        # snapshot — they aren't "react to the latest line" loops,
+        # they just shouldn't re-spin the LLM on unchanged content.
         self._last_summary_tx_hash: str | None = None
         self._last_action_items_tx_hash: str | None = None
 
@@ -248,20 +266,22 @@ class SessionAIOrchestrator:
                 if not transcript.strip():
                     continue
 
-                # Only fire when the OTHER side has spoken. If the
-                # transcript so far is just the host monologuing, there
-                # is nothing to react to — we'd otherwise answer the
-                # host's own questions back to themselves.
-                if not _has_contact_speech(transcript):
+                # Only fire when the LATEST line is from the contact.
+                # That captures the intent "react to what the other
+                # person just said". If the most recent speaker is the
+                # host, they're already mid-thought — let them finish.
+                last_speaker, last_text = _latest_speaker_line(transcript)
+                if last_speaker != "contact" or not last_text:
                     continue
 
-                # Global dedupe: if the transcript snapshot is bit-for-bit
-                # identical to the one we already spent an LLM call on,
-                # skip. Catches host-only ticks AND verbatim repeats.
-                tx_hash = _tx_hash(transcript)
-                if tx_hash == self._last_suggestion_tx_hash:
+                # Dedupe on the contact utterance itself so we don't
+                # re-fire while the host is silent (transcript-wide
+                # hash would change on every host filler word and
+                # bust the dedupe).
+                contact_hash = _line_hash(last_text)
+                if contact_hash == self._last_suggestion_contact_hash:
                     continue
-                self._last_suggestion_tx_hash = tx_hash
+                self._last_suggestion_contact_hash = contact_hash
 
                 screen_ctx = ""
                 cached_screen = await self._redis.get_cached_suggestion(
@@ -385,11 +405,13 @@ class SessionAIOrchestrator:
                 if not transcript.strip():
                     continue
 
-                # Action items require at least one back-and-forth.
-                # If only the host has spoken, there are no agreed
-                # commitments yet — skip to avoid hallucinating tasks
-                # out of monologue audio.
-                if not _has_contact_speech(transcript):
+                # Action items only make sense after at least one
+                # back-and-forth — skip pure monologue.
+                has_contact = any(
+                    line.strip().lower().startswith(("contact:", "[contact]"))
+                    for line in transcript.splitlines()
+                )
+                if not has_contact:
                     continue
 
                 # Dedupe — skip if transcript snapshot is unchanged.
