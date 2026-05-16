@@ -1,0 +1,12 @@
+# Garage Meeting Copilot — Qdrant Production Config
+
+service:
+  http_port: 6333
+  grpc_port: 6334
+  enable_cors: false
+
+storage:
+  storage_path: /qdrant/storage
+  snapshots_path: /qdrant/snapshots
+
+log_level: INFO

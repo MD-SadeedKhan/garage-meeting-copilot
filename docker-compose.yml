@@ -1,0 +1,194 @@
+version: "3.9"
+
+name: garage-meeting-copilot
+
+networks:
+  copilot-internal:
+    driver: bridge
+  garage-network:
+    external: true
+    name: garage_default
+
+volumes:
+  postgres-data:
+  redis-data:
+  qdrant-data:
+  nginx-logs:
+
+services:
+  # ─────────────────────────────────────────────
+  # NGINX — Reverse Proxy / API Gateway
+  # ─────────────────────────────────────────────
+  # nginx:
+  #   image: nginx:1.27-alpine
+  #   container_name: copilot-nginx
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:80"
+  #     - "8443:443"
+  #   volumes:
+  #     - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./infrastructure/nginx/conf.d:/etc/nginx/conf.d:ro
+  #     - nginx-logs:/var/log/nginx
+  #   networks:
+  #     - copilot-internal
+  #     - garage-network
+  #   depends_on:
+  #     meeting-ai-service:
+  #       condition: service_healthy
+  #     realtime-gateway:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test: ["CMD", "nginx", "-t"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+
+  # ─────────────────────────────────────────────
+  # MEETING AI SERVICE — Core AI Backend
+  # ─────────────────────────────────────────────
+  # meeting-ai-service:
+  #   build:
+  #     context: ./ai-service
+  #     dockerfile: Dockerfile
+  #     target: production
+  #   container_name: copilot-ai-service
+  #   restart: unless-stopped
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - SERVICE_NAME=meeting-ai-service
+  #     - SERVICE_PORT=8000
+  #   expose:
+  #     - "8000"
+  #   networks:
+  #     - copilot-internal
+  #     - garage-network
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     qdrant:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 20s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   volumes:
+  #     - ./ai-service:/app:delegated
+  #   command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--loop", "uvloop", "--http", "httptools"]
+
+  # ─────────────────────────────────────────────
+  # REALTIME GATEWAY — WebSocket Streaming
+  # ─────────────────────────────────────────────
+  # realtime-gateway:
+  #   build:
+  #     context: ./ai-service
+  #     dockerfile: Dockerfile
+  #     target: production
+  #   container_name: copilot-realtime-gateway
+  #   restart: unless-stopped
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - SERVICE_NAME=realtime-gateway
+  #     - SERVICE_PORT=8001
+  #   expose:
+  #     - "8001"
+  #   networks:
+  #     - copilot-internal
+  #     - garage-network
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #     qdrant:
+  #       condition: service_healthy
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+  #     interval: 20s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 30s
+  #   command: ["uvicorn", "app.gateway:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2", "--loop", "uvloop", "--http", "httptools"]
+
+  # ─────────────────────────────────────────────
+  # POSTGRESQL — Primary Datastore
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16.3-alpine
+    container_name: copilot-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-garage_copilot}
+      POSTGRES_USER: ${POSTGRES_USER:-copilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - copilot-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-copilot} -d ${POSTGRES_DB:-garage_copilot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    shm_size: 256mb
+
+  # ─────────────────────────────────────────────
+  # REDIS — Realtime State / Pub-Sub / Cache
+  # ─────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: copilot-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - copilot-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────
+  # QDRANT — Vector Memory Store
+  # ─────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:v1.10.1
+    container_name: copilot-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+      - ./infrastructure/docker/qdrant/config.yaml:/qdrant/config/production.yaml:ro
+    networks:
+      - copilot-internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:6333/readyz || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
