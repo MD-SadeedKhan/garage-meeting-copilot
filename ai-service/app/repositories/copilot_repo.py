@@ -85,6 +85,82 @@ class MeetingSessionRepository:
             )
         )
 
+    async def list_for_user(
+        self,
+        user_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        status_filter: str | None = None,
+    ) -> tuple[list[MeetingSession], int]:
+        """List sessions for a user with total count and chat message counts."""
+        from sqlalchemy import and_
+
+        base_filter = [MeetingSession.user_id == user_id]
+        if status_filter:
+            base_filter.append(MeetingSession.status == status_filter)
+
+        # Total count
+        count_result = await self._db.execute(
+            select(func.count(MeetingSession.id)).where(and_(*base_filter))
+        )
+        total = count_result.scalar_one() or 0
+
+        # Page
+        result = await self._db.execute(
+            select(MeetingSession)
+            .where(and_(*base_filter))
+            .order_by(MeetingSession.started_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        sessions = list(result.scalars().all())
+
+        if not sessions:
+            return [], total
+
+        # Message counts (subquery) for these sessions
+        session_ids = [s.id for s in sessions]
+        counts_result = await self._db.execute(
+            select(
+                AIInteraction.session_id,
+                func.count(AIInteraction.id),
+            )
+            .where(
+                AIInteraction.session_id.in_(session_ids),
+                AIInteraction.interaction_type == "chat",
+            )
+            .group_by(AIInteraction.session_id)
+        )
+        counts: dict[str, int] = {row[0]: row[1] for row in counts_result.all()}
+        # Attach as a transient attribute
+        for s in sessions:
+            setattr(s, "_message_count", counts.get(s.id, 0))
+
+        return sessions, total
+
+    async def rename(self, session_id: str, title: str) -> MeetingSession | None:
+        await self._db.execute(
+            update(MeetingSession)
+            .where(MeetingSession.id == session_id)
+            .values(title=title)
+        )
+        await self._db.flush()
+        return await self.get_by_id(session_id)
+
+    async def delete(self, session: MeetingSession) -> None:
+        await self._db.delete(session)
+        await self._db.flush()
+
+    async def set_title_if_empty(self, session_id: str, title: str) -> None:
+        await self._db.execute(
+            update(MeetingSession)
+            .where(
+                MeetingSession.id == session_id,
+                MeetingSession.title.is_(None),
+            )
+            .values(title=title)
+        )
+
     async def get_with_relations(self, session_id: str) -> MeetingSession | None:
         result = await self._db.execute(
             select(MeetingSession)
@@ -341,3 +417,15 @@ class AIInteractionRepository:
         self._db.add(interaction)
         await self._db.flush()
         return interaction
+
+    async def list_chat_for_session(self, session_id: str) -> list[AIInteraction]:
+        """Return chat interactions for a session in chronological order."""
+        result = await self._db.execute(
+            select(AIInteraction)
+            .where(
+                AIInteraction.session_id == session_id,
+                AIInteraction.interaction_type == "chat",
+            )
+            .order_by(AIInteraction.created_at.asc())
+        )
+        return list(result.scalars().all())

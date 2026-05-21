@@ -863,7 +863,10 @@ async def _persist_ai_interaction(
     latency_ms: int,
 ) -> None:
     """Background: Persist AI chat interaction to PostgreSQL."""
-    from app.repositories.copilot_repo import AIInteractionRepository
+    from app.repositories.copilot_repo import (
+        AIInteractionRepository,
+        MeetingSessionRepository,
+    )
     try:
         async with AsyncSessionLocal() as db:
             repo = AIInteractionRepository(db)
@@ -874,6 +877,13 @@ async def _persist_ai_interaction(
                 ai_response=ai_response,
                 latency_ms=latency_ms,
             )
+            # Cheap autoname: if the session has no title yet, use first 80 chars
+            # of the first user message so the FE list isn't all "Untitled".
+            if user_message:
+                session_repo = MeetingSessionRepository(db)
+                await session_repo.set_title_if_empty(
+                    session_id, user_message.strip()[:80]
+                )
             await db.commit()
     except Exception as e:
         logger.error("interaction_persist_failed", error=str(e))

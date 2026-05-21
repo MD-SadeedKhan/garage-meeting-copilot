@@ -428,9 +428,14 @@ class SuggestionPipeline:
 
     def __init__(self) -> None:
         self._settings = get_settings()
+        # Suggestions optimise for latency over depth — gpt-4o-mini
+        # returns in ~500-800ms vs gpt-4.1's 2-5s, and the task
+        # (single-utterance reaction with full context already
+        # assembled in the prompt) doesn't need the bigger model.
+        # Summaries + chat keep the configured `openai_llm_model`.
         self._llm = ChatOpenAI(
             api_key=self._settings.openai_api_key,
-            model=self._settings.openai_llm_model,
+            model=self._settings.openai_suggestion_model,
             temperature=0.5,
             max_tokens=1500,
         )

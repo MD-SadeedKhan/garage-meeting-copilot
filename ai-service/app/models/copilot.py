@@ -58,6 +58,7 @@ class MeetingSession(Base):
         server_default=func.now(),
     )
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     metadata_: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
         JSONB,

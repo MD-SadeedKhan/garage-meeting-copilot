@@ -49,7 +49,11 @@ class Settings(BaseSettings):
 
     # ── OpenAI ────────────────────────────────
     openai_api_key: str = Field(...)
+    # Used by chat + summary + action-items pipelines. Quality matters.
     openai_llm_model: str = "gpt-4.1"
+    # Used ONLY by the realtime SuggestionPipeline. Override to gpt-4.1
+    # if you'd rather burn latency for depth on suggestions.
+    openai_suggestion_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-large"
     openai_max_tokens: int = 4096
 
@@ -86,7 +90,11 @@ class Settings(BaseSettings):
     s3_bucket_recordings: str = "garage-copilot-recordings"
 
     # ── AI Pipeline Config ────────────────────
-    suggestion_interval_seconds: int = 4
+    # Suggestion loop polls Redis for new contact utterances. Lower
+    # = lower latency from "contact stops talking" → suggestion
+    # showing in the FE; cost stays ~flat because dedupe still
+    # blocks LLM calls when the contact line is unchanged.
+    suggestion_interval_seconds: int = 1
     summary_interval_seconds: int = 60
     action_item_interval_seconds: int = 30
     max_transcript_context_tokens: int = 8000
