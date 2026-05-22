@@ -16,10 +16,22 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "meeting_sessions",
-        sa.Column("title", sa.String(length=200), nullable=True),
-    )
+    # Idempotent — previous deploy may have ALTER'd the table successfully
+    # before crashing on the alembic_version bookkeeping update (revision id
+    # was >32 chars). Re-running this upgrade against a DB that already has
+    # the column would otherwise blow up with "column already exists".
+    bind = op.get_bind()
+    existing = bind.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='meeting_sessions' AND column_name='title'"
+        )
+    ).scalar()
+    if not existing:
+        op.add_column(
+            "meeting_sessions",
+            sa.Column("title", sa.String(length=200), nullable=True),
+        )
 
 
 def downgrade() -> None:
