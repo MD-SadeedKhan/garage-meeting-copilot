@@ -162,6 +162,48 @@ class DeepgramStreamingService:
         if self._running and not self._audio_queue.full():
             await self._audio_queue.put(audio_bytes)
 
+    async def run_keepalive_loop(self) -> None:
+        """
+        Deepgram closes the streaming WebSocket after ~10s of no audio
+        traffic. With three concurrent sessions per copilot session
+        (self / others / mixed) it's normal for one or two of them to
+        sit silent — the host hasn't spoken yet, or no remote
+        participant joined — which triggers the idle close.
+
+        Once closed, our `send_audio` silently drops everything
+        because `_running` flips false. The host pipeline then looks
+        dead for the rest of the call.
+
+        Fix: emit Deepgram's documented `{"type":"KeepAlive"}` frame
+        every 5 seconds while running. Deepgram resets the idle timer
+        on receipt; bytes-or-keepalive keeps the WS alive
+        indefinitely.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(5)
+                if not self._running or self._connection is None:
+                    break
+                # Both `send_json` (newer SDK) and `send(str)` (older)
+                # work — try the JSON path first, fall back to send.
+                payload = '{"type":"KeepAlive"}'
+                try:
+                    await self._connection.send(payload)
+                except Exception as e:
+                    logger.warning(
+                        "deepgram_keepalive_send_failed",
+                        session_id=self._session_id,
+                        error=str(e),
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(
+                    "deepgram_keepalive_loop_error",
+                    session_id=self._session_id,
+                    error=str(e),
+                )
+
     async def run_send_loop(self) -> None:
         """
         Continuously drain the audio queue and send to Deepgram.
@@ -328,7 +370,9 @@ class DeepgramSessionManager:
         # compatible: legacy callers without a source land in the
         # "mixed" bucket.
         self._sessions: dict[tuple[str, str], DeepgramStreamingService] = {}
-        self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        # Each entry holds the send-loop task AND the keepalive task
+        # so both get cancelled together on session end.
+        self._tasks: dict[tuple[str, str], list[asyncio.Task[None]]] = {}
 
     @staticmethod
     def _label_for_source(source: str) -> str | None:
@@ -359,9 +403,14 @@ class DeepgramSessionManager:
         )
         await service.start()
 
-        # Run the send loop as a background task
-        task = asyncio.create_task(service.run_send_loop())
-        self._tasks[key] = task
+        # Run the send loop AND keepalive loop as background tasks.
+        # Without keepalive, Deepgram closes the WS after 10s of
+        # silence — fatal for sessions where the host or contact
+        # doesn't speak in the first few seconds.
+        self._tasks[key] = [
+            asyncio.create_task(service.run_send_loop()),
+            asyncio.create_task(service.run_keepalive_loop()),
+        ]
         self._sessions[key] = service
 
         logger.info(
@@ -387,9 +436,11 @@ class DeepgramSessionManager:
             if service:
                 await service.stop()
 
-            task = self._tasks.pop(key, None)
-            if task and not task.done():
-                task.cancel()
+            tasks = self._tasks.pop(key, []) or []
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for task in tasks:
                 try:
                     await task
                 except asyncio.CancelledError:
