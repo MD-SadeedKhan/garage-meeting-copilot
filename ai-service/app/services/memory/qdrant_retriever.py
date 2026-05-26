@@ -12,10 +12,39 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qdrant_models
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+import asyncio
+
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.services.usage_client import record_usage
 
 logger = get_logger(__name__)
+
+
+def _emit_embedding_usage(
+    response: Any,
+    *,
+    model: str,
+    user_id: str | None,
+    session_id: str | None,
+) -> None:
+    """Fire-and-forget metering for an OpenAI embedding response."""
+    if not user_id:
+        return
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return
+    asyncio.create_task(
+        record_usage(
+            user_id=user_id,
+            product="earngpt_live",
+            provider="openai",
+            model=model,
+            kind="embedding",
+            metrics={"totalTokens": getattr(usage, "total_tokens", 0)},
+            ref_id=session_id,
+        )
+    )
 
 
 class QdrantRetriever:
@@ -79,12 +108,24 @@ class QdrantRetriever:
 
     # ── Embedding Generation ──────────────────
 
-    async def embed_text(self, text: str) -> list[float]:
+    async def embed_text(
+        self,
+        text: str,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> list[float]:
         """Generate OpenAI text-embedding-3-large embedding."""
         openai = self._get_openai()
         response = await openai.embeddings.create(
             model=self._settings.openai_embedding_model,
             input=text.strip(),
+        )
+        _emit_embedding_usage(
+            response,
+            model=self._settings.openai_embedding_model,
+            user_id=user_id,
+            session_id=session_id,
         )
         return response.data[0].embedding
 
@@ -117,7 +158,9 @@ class QdrantRetriever:
         if not text.strip():
             return chunk_id
 
-        embedding = await self.embed_text(text)
+        embedding = await self.embed_text(
+            text, user_id=user_id, session_id=session_id
+        )
         point_id = str(uuid.uuid4())
 
         client = await self._get_client()

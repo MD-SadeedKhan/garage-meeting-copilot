@@ -408,6 +408,7 @@ async def request_suggestions(
         session_id=session_id,
         recent_transcript=body.transcript_window,
         screen_context=body.context,
+        user_id=auth.user_id,
     )
     return {"session_id": session_id, "suggestions": suggestions}
 

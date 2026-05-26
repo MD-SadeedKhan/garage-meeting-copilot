@@ -15,8 +15,43 @@ from langgraph.graph import END, START, StateGraph
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.services.memory.qdrant_retriever import QdrantRetriever
+from app.services.usage_client import record_usage
 
 logger = get_logger(__name__)
+
+
+def _emit_chat_usage(
+    response: AIMessage,
+    *,
+    model: str,
+    user_id: str | None,
+    session_id: str | None,
+) -> None:
+    """Fire-and-forget metering for one LangChain chat response.
+
+    LangChain populates `usage_metadata` ({input_tokens, output_tokens})
+    on AIMessage when the provider returns token usage. Best-effort —
+    no usage / no user_id → skip silently.
+    """
+    if not user_id:
+        return
+    usage = getattr(response, "usage_metadata", None)
+    if not usage:
+        return
+    asyncio.create_task(
+        record_usage(
+            user_id=user_id,
+            product="earngpt_live",
+            provider="openai",
+            model=model,
+            kind="chat",
+            metrics={
+                "promptTokens": usage.get("input_tokens", 0),
+                "completionTokens": usage.get("output_tokens", 0),
+            },
+            ref_id=session_id,
+        )
+    )
 
 
 # ── State Definitions ─────────────────────────────────────────────────────────
@@ -322,6 +357,9 @@ class MeetingContextPipeline:
             temperature=0.3,
             max_tokens=self._settings.openai_max_tokens,
             streaming=True,
+            # Ask OpenAI to include a final usage chunk in the stream so
+            # we can meter token cost on the streaming chat path too.
+            stream_usage=True,
         )
         self._graph = self._build_graph()
 
@@ -390,6 +428,8 @@ class MeetingContextPipeline:
         recent_transcript: str,
         screen_context: str = "",
         workspace_context: dict[str, Any] | None = None,
+        user_id: str | None = None,
+        usage_sink: dict[str, int] | None = None,
     ):
         """Stream response tokens for real-time chat overlay."""
         # First run retrieve + assemble synchronously
@@ -426,8 +466,25 @@ class MeetingContextPipeline:
             ),
         ]
 
+        # Aggregate chunks so the trailing usage_metadata chunk (emitted
+        # because stream_usage=True) can be metered after the stream ends.
+        agg: AIMessage | None = None
         async for chunk in self._streaming_llm.astream(messages):
-            yield chunk.content
+            agg = chunk if agg is None else agg + chunk
+            if chunk.content:
+                yield chunk.content
+
+        if agg is not None:
+            _emit_chat_usage(
+                agg,
+                model=self._settings.openai_llm_model,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if usage_sink is not None:
+                usage = getattr(agg, "usage_metadata", None) or {}
+                usage_sink["promptTokens"] = usage.get("input_tokens", 0)
+                usage_sink["completionTokens"] = usage.get("output_tokens", 0)
 
 
 class SuggestionPipeline:
@@ -454,6 +511,7 @@ class SuggestionPipeline:
         screen_context: str = "",
         rolling_summary: str = "",
         meeting_context: dict[str, Any] | None = None,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Generate contextual suggestions from recent transcript.
 
@@ -493,6 +551,12 @@ class SuggestionPipeline:
 
         try:
             response = await self._llm.ainvoke(messages)
+            _emit_chat_usage(
+                response,
+                model=self._settings.openai_suggestion_model,
+                user_id=user_id,
+                session_id=session_id,
+            )
             import json
             parsed = json.loads(response.content)
             return parsed.get("suggestions", [])
@@ -522,6 +586,7 @@ class SummaryPipeline:
         session_id: str,
         full_transcript: str,
         previous_summary: str = "",
+        user_id: str | None = None,
     ) -> str:
         """Generate or update the rolling meeting summary."""
         context = full_transcript
@@ -535,6 +600,12 @@ class SummaryPipeline:
 
         try:
             response = await self._llm.ainvoke(messages)
+            _emit_chat_usage(
+                response,
+                model=self._settings.openai_llm_model,
+                user_id=user_id,
+                session_id=session_id,
+            )
             return response.content
         except Exception as e:
             logger.error(
@@ -548,6 +619,7 @@ class SummaryPipeline:
         self,
         session_id: str,
         transcript: str,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Extract structured action items from transcript."""
         if not transcript.strip():
@@ -560,6 +632,12 @@ class SummaryPipeline:
 
         try:
             response = await self._llm.ainvoke(messages)
+            _emit_chat_usage(
+                response,
+                model=self._settings.openai_llm_model,
+                user_id=user_id,
+                session_id=session_id,
+            )
             import json
             parsed = json.loads(response.content)
             return parsed.get("action_items", [])

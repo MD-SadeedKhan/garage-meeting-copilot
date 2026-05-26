@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # ── Garage Ecosystem Integration ──────────
     garage_api_base_url: AnyHttpUrl | None = None
     contacts_backend_base_url: str = "http://host.docker.internal:8080"
+    # Shared service secret for authenticating server-to-server calls to
+    # contacts-backend's /internal/* endpoints (matches the backend's
+    # OPENCLAW_NC_SERVICE_SECRET). Used by the usage-metering client.
+    contacts_backend_service_secret: str | None = None
     garage_jwt_secret: str = Field(..., min_length=16)
     garage_jwt_algorithm: str = "HS256"
     garage_jwt_audience: str | None = None

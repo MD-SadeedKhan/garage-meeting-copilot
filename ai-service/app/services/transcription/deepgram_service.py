@@ -109,6 +109,19 @@ class DeepgramStreamingService:
         # Deepgram's anonymous diarization output for this stream.
         self._source = source
         self._forced_speaker_label = forced_speaker_label
+        # Running total of transcribed audio for STT billing. Summed from
+        # FINAL chunk durations only (interims would double-count). Read
+        # at session teardown to emit one Deepgram usage event per source.
+        self._audio_seconds: float = 0.0
+
+    @property
+    def audio_seconds(self) -> float:
+        """Total seconds of audio transcribed on this stream (final only)."""
+        return self._audio_seconds
+
+    @property
+    def model(self) -> str:
+        return self._settings.deepgram_model
 
     async def start(self) -> None:
         """Initialise Deepgram client and open live connection."""
@@ -266,6 +279,11 @@ class DeepgramStreamingService:
             start_time = result.start or 0.0
             duration = result.duration or 0.0
             end_time = start_time + duration
+
+            # Accumulate billable audio seconds from FINAL results only —
+            # interim results re-cover the same span and would double-count.
+            if is_final and duration > 0:
+                self._audio_seconds += duration
 
             confidence = alt.confidence or 0.0
 

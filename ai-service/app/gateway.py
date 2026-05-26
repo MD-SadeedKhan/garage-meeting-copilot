@@ -36,6 +36,7 @@ from app.services.ai.langgraph_pipeline import (
 )
 from app.services.memory.qdrant_retriever import qdrant_retriever
 from app.services.ocr.screen_ocr import screen_ocr_pipeline
+from app.services.usage_client import record_usage
 from app.services.transcription.deepgram_service import (
     DeepgramStreamingService,
     deepgram_manager,
@@ -218,10 +219,12 @@ class SessionAIOrchestrator:
         garage_meeting_id: str,
         organization_id: str,
         redis_state: RedisStreamState,
+        user_id: str | None = None,
     ) -> None:
         self._session_id = session_id
         self._garage_meeting_id = garage_meeting_id
         self._organization_id = organization_id
+        self._user_id = user_id
         self._redis = redis_state
         self._running = False
         self._tasks: list[asyncio.Task[None]] = []
@@ -321,6 +324,7 @@ class SessionAIOrchestrator:
                     screen_context=screen_ctx,
                     rolling_summary=rolling_summary,
                     meeting_context=meeting_context,
+                    user_id=self._user_id,
                 )
 
                 if suggestions:
@@ -372,6 +376,7 @@ class SessionAIOrchestrator:
                     session_id=self._session_id,
                     full_transcript=transcript,
                     previous_summary=prev_summary,
+                    user_id=self._user_id,
                 )
 
                 if new_summary:
@@ -434,6 +439,7 @@ class SessionAIOrchestrator:
                 items = await _summary_pipeline.extract_action_items(
                     session_id=self._session_id,
                     transcript=transcript,
+                    user_id=self._user_id,
                 )
 
                 if items:
@@ -624,6 +630,7 @@ async def copilot_websocket(
             garage_meeting_id=garage_meeting_id,
             organization_id=organization_id,
             redis_state=redis_state,
+            user_id=auth_context.user_id,
         )
         await orchestrator.start()
         _orchestrators[session_id] = orchestrator
@@ -681,6 +688,7 @@ async def copilot_websocket(
                             organization_id=organization_id,
                             user_message=user_message,
                             redis_state=redis_state,
+                            user_id=auth_context.user_id,
                         )
                     )
 
@@ -733,6 +741,26 @@ async def copilot_websocket(
             orch = _orchestrators.pop(session_id, None)
             if orch:
                 asyncio.create_task(orch.stop())
+
+            # Emit Deepgram STT usage for the whole session before tearing
+            # down the streams (one event per audio source, summing each
+            # stream's final-chunk durations — no double counting). Best-
+            # effort, fire-and-forget so it never delays teardown.
+            for _source, _svc in dg_by_source.items():
+                _secs = getattr(_svc, "audio_seconds", 0.0)
+                if _secs > 0:
+                    asyncio.create_task(
+                        record_usage(
+                            user_id=auth_context.user_id,
+                            product="earngpt_live",
+                            provider="deepgram",
+                            model=getattr(_svc, "model", settings.deepgram_model),
+                            kind="stt",
+                            metrics={"audioSeconds": _secs},
+                            ref_id=session_id,
+                        )
+                    )
+
             await deepgram_manager.end_session(session_id)
 
 
@@ -742,10 +770,12 @@ async def _handle_chat(
     organization_id: str,
     user_message: str,
     redis_state: RedisStreamState,
+    user_id: str | None = None,
 ) -> None:
     """Stream AI chat response token by token to the overlay."""
     start = time.monotonic()
     full_response = ""
+    usage_sink: dict[str, int] = {}
 
     recent_transcript = await redis_state.get_recent_transcript_text(
         session_id, last_n=40
@@ -765,6 +795,8 @@ async def _handle_chat(
             user_query=user_message,
             recent_transcript=recent_transcript,
             screen_context=screen_context,
+            user_id=user_id,
+            usage_sink=usage_sink,
         ):
             if token:
                 full_response += token
@@ -795,6 +827,8 @@ async def _handle_chat(
                 user_message=user_message,
                 ai_response=full_response,
                 latency_ms=latency_ms,
+                prompt_tokens=usage_sink.get("promptTokens", 0),
+                completion_tokens=usage_sink.get("completionTokens", 0),
             )
         )
 
@@ -861,6 +895,8 @@ async def _persist_ai_interaction(
     user_message: str,
     ai_response: str,
     latency_ms: int,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
 ) -> None:
     """Background: Persist AI chat interaction to PostgreSQL."""
     from app.repositories.copilot_repo import (
@@ -876,6 +912,8 @@ async def _persist_ai_interaction(
                 user_message=user_message,
                 ai_response=ai_response,
                 latency_ms=latency_ms,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
             # Cheap autoname: if the session has no title yet, use first 80 chars
             # of the first user message so the FE list isn't all "Untitled".
