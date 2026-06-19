@@ -91,6 +91,7 @@ class MeetingSessionRepository:
         limit: int = 50,
         offset: int = 0,
         status_filter: str | None = None,
+        source: str | None = None,
     ) -> tuple[list[MeetingSession], int]:
         """List sessions for a user with total count and chat message counts."""
         from sqlalchemy import and_
@@ -98,6 +99,12 @@ class MeetingSessionRepository:
         base_filter = [MeetingSession.user_id == user_id]
         if status_filter:
             base_filter.append(MeetingSession.status == status_filter)
+        # Money Stream vs Catch Up discriminator: the LiveKit room-name prefix,
+        # stored as garage_meeting_id. Money Stream rooms are "webinar-<id>".
+        if source == "moneystream":
+            base_filter.append(MeetingSession.garage_meeting_id.like("webinar-%"))
+        elif source == "catchup":
+            base_filter.append(MeetingSession.garage_meeting_id.notlike("webinar-%"))
 
         # Total count
         count_result = await self._db.execute(

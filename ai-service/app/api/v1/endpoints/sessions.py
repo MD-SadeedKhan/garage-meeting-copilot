@@ -101,6 +101,7 @@ async def list_sessions(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status_filter: str | None = Query(None, alias="status"),
+    source: str | None = Query(None),
     auth: GarageAuthContext = Depends(require_garage_auth),
     db=Depends(get_db),
 ) -> SessionListResponse:
@@ -111,6 +112,7 @@ async def list_sessions(
         limit=limit,
         offset=offset,
         status_filter=status_filter,
+        source=source,
     )
 
     items: list[SessionListItem] = []
