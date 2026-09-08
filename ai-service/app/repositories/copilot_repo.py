@@ -25,6 +25,27 @@ from app.models.copilot import (
 logger = get_logger(__name__)
 
 
+def is_valid_session_id(session_id: str) -> bool:
+    """Is this id one Postgres will even accept as a `uuid`?
+
+    `MeetingSession.id` is a `uuid` column, so `WHERE id = 'not-a-uuid'` does
+    not return zero rows — the driver raises `invalid input syntax for type
+    uuid` as the statement runs. Every one of the sixteen `{session_id}` routes
+    already handles a missing session correctly, and none of them could reach
+    that code: the query blew up first, so a bad id in a URL surfaced as a 500.
+
+    Guarded here rather than at each route because all sixteen funnel through
+    the lookups below, whose contracts already say `| None` — an id no session
+    can possibly have is simply not found. A per-route check would be sixteen
+    places to keep in step, across two files.
+    """
+    try:
+        uuid.UUID(session_id)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
 class MeetingSessionRepository:
     """CRUD operations for MeetingSession entities."""
 
@@ -56,6 +77,8 @@ class MeetingSessionRepository:
         return session
 
     async def get_by_id(self, session_id: str) -> MeetingSession | None:
+        if not is_valid_session_id(session_id):
+            return None
         result = await self._db.execute(
             select(MeetingSession).where(MeetingSession.id == session_id)
         )
@@ -169,6 +192,8 @@ class MeetingSessionRepository:
         )
 
     async def get_with_relations(self, session_id: str) -> MeetingSession | None:
+        if not is_valid_session_id(session_id):
+            return None
         result = await self._db.execute(
             select(MeetingSession)
             .options(
