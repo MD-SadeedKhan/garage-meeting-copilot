@@ -38,7 +38,7 @@ def _emit_embedding_usage(
         record_usage(
             user_id=user_id,
             product="earngpt_live",
-            provider="openai",
+            provider="deploymachine" if get_settings().embedding_base_url else "openai",
             model=model,
             kind="embedding",
             metrics={"totalTokens": getattr(usage, "total_tokens", 0)},
@@ -69,7 +69,11 @@ class QdrantRetriever:
 
     def _get_openai(self) -> AsyncOpenAI:
         if self._openai is None:
-            self._openai = AsyncOpenAI(api_key=self._settings.openai_api_key)
+            s = self._settings
+            self._openai = AsyncOpenAI(
+                api_key=s.earngpt_model_api_key if s.embedding_base_url else s.openai_api_key,
+                base_url=s.embedding_base_url or None,
+            )
         return self._openai
 
     # ── Collection Management ─────────────────
@@ -115,11 +119,12 @@ class QdrantRetriever:
         user_id: str | None = None,
         session_id: str | None = None,
     ) -> list[float]:
-        """Generate OpenAI text-embedding-3-large embedding."""
+        """Embed one text with the configured model."""
         openai = self._get_openai()
         response = await openai.embeddings.create(
             model=self._settings.openai_embedding_model,
             input=text.strip(),
+            encoding_format="float",
         )
         _emit_embedding_usage(
             response,
@@ -135,8 +140,16 @@ class QdrantRetriever:
         response = await openai.embeddings.create(
             model=self._settings.openai_embedding_model,
             input=[t.strip() for t in texts],
+            encoding_format="float",
         )
         return [item.embedding for item in response.data]
+
+    async def embed_query(self, query: str, task: str) -> list[float]:
+        """Embed a search query. Qwen3-Embedding wants a one-line task
+        instruction on the query side only; OpenAI's models are symmetric."""
+        if "qwen" in self._settings.openai_embedding_model.lower():
+            query = f"Instruct: {task}\nQuery:{query}"
+        return await self.embed_text(query)
 
     # ── Transcript Indexing ───────────────────
 
@@ -240,7 +253,7 @@ class QdrantRetriever:
         Semantic search over transcript chunks for a specific session.
         Returns ranked chunks most relevant to the query.
         """
-        embedding = await self.embed_text(query)
+        embedding = await self.embed_query(query, "Given a question asked during a meeting, retrieve the parts of the meeting transcript that answer it")
         client = await self._get_client()
 
         results = await client.search(
@@ -286,7 +299,7 @@ class QdrantRetriever:
         """
         Search across all meetings for an organization — historical context.
         """
-        embedding = await self.embed_text(query)
+        embedding = await self.embed_query(query, "Given a question asked during a meeting, retrieve relevant moments from earlier meetings")
         client = await self._get_client()
 
         must_conditions: list[Any] = [

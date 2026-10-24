@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     # if you'd rather burn latency for depth on suggestions.
     openai_suggestion_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-large"
+    # Set to an OpenAI-compatible endpoint (our DeployMachine vLLM) to embed
+    # there instead, with EARNGPT_MODEL_API_KEY as the key. Change it together
+    # with openai_embedding_model, qdrant_vector_size and the collection names:
+    # vectors from two models are not comparable.
+    embedding_base_url: str = ""
+    earngpt_model_api_key: str = ""
     openai_max_tokens: int = 4096
 
     # ── Deepgram ──────────────────────────────
