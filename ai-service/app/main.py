@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
+from app.services.trace_setup import configure_tracing
 from app.core.database import AsyncSessionLocal, check_db_connection, get_db
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import RedisStreamState, check_redis_connection, get_redis
@@ -55,6 +56,7 @@ _suggestion_pipeline = SuggestionPipeline()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("meeting_ai_service_starting")
+    configure_tracing()
     await qdrant_retriever.ensure_collections()
     logger.info("meeting_ai_service_ready")
     yield

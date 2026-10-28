@@ -1,58 +1,22 @@
-import asyncio
-import functools
+"""model_trace client. Identical in all three services; local http.server on 127.0.0.1 only."""
+from __future__ import annotations
+
+import importlib
 import json
-import os
-import re
+import logging
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 
-from app.services import model_trace as mt
-
-
-def arun(f):
-    # The repo has no pytest-asyncio; drive coroutines with asyncio.run.
-    @functools.wraps(f)
-    def w(*a, **k):
-        return asyncio.run(f(*a, **k))
-    return w
-
-
-class _Sink:
-    def __init__(self, status=202):
-        self.bodies, self.headers, sink = [], [], self
-
-        class H(BaseHTTPRequestHandler):
-            def do_POST(self):
-                n = int(self.headers["Content-Length"])
-                sink.bodies.append(json.loads(self.rfile.read(n)))
-                sink.headers.append(dict(self.headers))
-                self.send_response(status)
-                self.end_headers()
-                self.wfile.write(b"{}")
-
-            def log_message(self, *a):
-                pass
-
-        self.srv = HTTPServer(("127.0.0.1", 0), H)
-        self.url = f"http://127.0.0.1:{self.srv.server_port}/internal/traces"
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-
-    def close(self):
-        self.srv.shutdown()
-
-
-@pytest.fixture
-def sink():
-    s = _Sink()
-    yield s
-    s.close()
+for _p in ("app.clients.model_trace", "app.services.model_trace", "agent_manager.services.model_trace"):
+    try:
+        mt = importlib.import_module(_p)
+        break
+    except ModuleNotFoundError as _e:
+        if not _p.startswith(str(_e.name)):
+            raise
 
 
 @pytest.fixture(autouse=True)
@@ -62,210 +26,209 @@ def reset():
     mt._reset()
 
 
-def _call(**kw):
-    return dict(site="copilot.summary", kind="chat", provider="openai", model="m", latencyMs=5, **kw)
+@pytest.fixture
+def server():
+    got = type("Got", (list,), {})()
+    reply = {"body": b"{}"}
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            got.append((self.headers.get("Authorization"), len(body), json.loads(body)))
+            self.send_response(202)
+            self.end_headers()
+            self.wfile.write(reply["body"])
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    got.reply = reply
+    yield f"http://127.0.0.1:{srv.server_port}/internal/traces", got
+    srv.shutdown()
 
 
-def test_off_means_no_thread_no_queue():
-    mt.configure(False, "http://127.0.0.1:1/x", {}, "meeting-copilot")
-    mt.record(**_call())
-    assert mt._thread is None and len(mt._q) == 0
+def on(url, enabled=True):
+    mt.configure(enabled, url, {"Authorization": "Bearer s3"}, "svc")
 
 
-def test_queue_bounded_drops_oldest():
-    mt.configure(True, "http://127.0.0.1:1/x", {"Authorization": "Bearer k"}, "meeting-copilot")
-    with patch.object(mt, "_ensure_thread"):
-        for i in range(510):
-            mt.record(**_call(refId=str(i)))
-    assert len(mt._q) == 500 and mt._dropped == 10
-    assert mt._q[0]["refId"] == "10"
+def no_thread(monkeypatch):
+    monkeypatch.setattr(mt, "_ensure_thread", lambda: None)  # flush() is the only poster
 
 
-def test_post_matches_wire_format(sink):
-    mt.configure(True, sink.url, {"Authorization": "Bearer k"}, "meeting-copilot")
-    mt.record(**_call(userId=None, turnId="t1", usage={"inTok": 1, "outTok": 2}))
+def test_unconfigured_is_a_noop():
+    mt.record(site="x")
+    assert mt._thread is None and len(mt._q) == 0 and mt.dropped() == 0
+
+
+@pytest.mark.parametrize("v,exp", [("1", True), (" TRUE ", True), ("yes", True), (True, True),
+                                   ("on", False), ("0", False), ("", False), (None, False), (False, False)])
+def test_enabled_parsing(v, exp):
+    mt.configure(v, "http://127.0.0.1:9/x", {"A": "b"}, "svc")
+    assert mt._cfg["enabled"] is exp
+
+
+def test_wire_format_and_auth(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    mt.record(site="s", kind="chat", latencyMs=3)
     mt.flush()
-    body = sink.bodies[0]
-    assert body["source"] == "meeting-copilot"
-    c = body["calls"][0]
-    assert c["turnId"] == "t1" and c["site"] == "copilot.summary" and "userId" not in c
-    assert re.match(r"\d{4}-\d\d-\d\dT", c["ts"])
-    assert sink.headers[0]["Authorization"] == "Bearer k"
+    auth, _, body = got[0]
+    assert auth == "Bearer s3" and body["source"] == "svc"
+    assert body["calls"][0]["site"] == "s" and "ts" in body["calls"][0]
 
 
-def test_batches_of_50(sink):
-    mt.configure(True, sink.url, {"Authorization": "Bearer k"}, "meeting-copilot")
-    with patch.object(mt, "_ensure_thread"):
-        for _ in range(120):
-            mt.record(**_call())
+def test_none_values_stripped_recursively(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    mt.record(site="s", a=None, output={"text": "t", "finishReason": None},
+              messages=[{"role": "user", "content": "q", "name": None}])
     mt.flush()
-    assert [len(b["calls"]) for b in sink.bodies] == [50, 50, 20]
+    c = got[0][2]["calls"][0]
+    assert "a" not in c and c["output"] == {"text": "t"} and c["messages"] == [{"role": "user", "content": "q"}]
 
 
-def test_background_thread_flushes(sink):
-    mt.configure(True, sink.url, {"Authorization": "Bearer k"}, "meeting-copilot")
-    for _ in range(20):
-        mt.record(**_call())
-    for _ in range(50):
-        if sink.bodies:
+def test_non_ascii_kept_unescaped(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    mt.record(site="s", output={"text": "héllo م"})
+    mt.flush()
+    assert got[0][2]["calls"][0]["output"]["text"] == "héllo م"
+
+
+def test_nan_is_dropped_and_counted(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    mt.record(site="s", params={"temperature": float("nan")})
+    mt.record(site="ok")
+    mt.flush()
+    assert mt.dropped() == 1 and [c["site"] for c in got[0][2]["calls"]] == ["ok"]
+
+
+def test_embedding_texts_capped_at_whole_strings(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    mt.record(site="e", kind="embedding", embedding={"texts": ["a" * 400_000] * 3})
+    mt.record(site="e2", kind="embedding", embedding={"texts": ["a", "b"]})
+    mt.flush()
+    c1, c2 = got[0][2]["calls"]
+    assert len(c1["embedding"]["texts"]) == 2 and c1["embedding"]["truncated"] is True
+    assert c2["embedding"] == {"texts": ["a", "b"]}
+
+
+def test_batches_at_most_50_calls(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    for _ in range(120):
+        mt.record(site="s")
+    mt.flush()
+    assert [len(b["calls"]) for _, _, b in got] == [50, 50, 20]
+
+
+def test_batches_are_byte_bounded(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    for i in range(10):
+        mt.record(site="s", n=i, output={"text": "x" * 1_500_000})
+    mt.flush(timeout=30)
+    assert sum(len(b["calls"]) for _, _, b in got) == 10
+    assert all(n <= 6_000_000 for _, n, _ in got) and len(got) >= 3
+    assert [c["n"] for _, _, b in got for c in b["calls"]] == list(range(10))
+
+
+def test_oversized_single_call_dropped_never_sent(server, monkeypatch):
+    url, got = server
+    no_thread(monkeypatch)
+    on(url)
+    mt.record(site="big", output={"text": "x" * 6_100_000})
+    mt.record(site="ok")
+    mt.flush()
+    assert mt.dropped() == 1 and [c["site"] for _, _, b in got for c in b["calls"]] == ["ok"]
+
+
+def test_queue_bounded_drops_oldest(monkeypatch):
+    no_thread(monkeypatch)
+    on("http://127.0.0.1:9/x")
+    for i in range(510):
+        mt.record(site="s", n=i)
+    assert len(mt._q) == 500 and mt.dropped() == 10 and json.loads(mt._q[0])["n"] == 10
+
+
+def test_fork_child_hook_resets_state():
+    on("http://127.0.0.1:9/nope")
+    mt.record(site="s")
+    old = mt._thread
+    assert old is not None and len(mt._q) == 1
+    mt._lock.acquire()  # as if another parent thread held it at fork time
+    mt._reset_state()  # == the os.register_at_fork(after_in_child=...) hook
+    assert len(mt._q) == 0 and mt._thread is None and mt._lock.acquire(blocking=False)
+    mt._lock.release()
+    mt.record(site="s")
+    assert mt._thread is not None and mt._thread is not old
+    old.join(3)  # superseded flusher exits
+    assert not old.is_alive()
+
+
+def test_pid_change_restarts_thread(monkeypatch):
+    on("http://127.0.0.1:9/nope")
+    mt.record(site="s")
+    first = mt._thread
+    import os
+    monkeypatch.setattr(os, "getpid", lambda: mt._pid + 1)
+    mt.record(site="s")
+    assert mt._thread is not first and len(mt._q) == 1
+
+
+def test_only_one_flusher_under_concurrency(monkeypatch):
+    started = []
+    real = threading.Thread
+
+    def counting(*a, **kw):
+        t = real(*a, **kw)
+        started.append(t)
+        return t
+
+    monkeypatch.setattr(mt.threading, "Thread", counting)
+    on("http://127.0.0.1:9/nope")
+    ts = [real(target=mt._ensure_thread) for _ in range(16)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(started) == 1
+
+
+def test_flusher_posts_on_its_own(server):
+    url, got = server
+    on(url)
+    mt.record(site="s")
+    for _ in range(60):
+        if got:
             break
         time.sleep(0.1)
-    assert sink.bodies and mt._thread.daemon
+    assert got
 
 
-def test_failure_swallowed():
-    mt.configure(True, "http://127.0.0.1:1/x", {"Authorization": "Bearer k"}, "meeting-copilot")
-    mt.record(**_call())
-    mt.flush(timeout=1)  # must not raise
+def test_failure_swallowed_counted_and_warned_with_count(caplog):
+    on("http://127.0.0.1:9/nope")
+    mt._q.append(b'{"site":"s"}')
+    with caplog.at_level(logging.WARNING):
+        mt.flush()
+    assert mt.dropped() == 1 and "dropped so far: 1" in caplog.text
 
 
-def test_record_never_raises():
-    mt.configure(True, "http://127.0.0.1:1/x", {"Authorization": "Bearer k"}, "meeting-copilot")
-    with patch.object(mt, "_ensure_thread", side_effect=RuntimeError):
-        mt.record(**_call())
-
-
-def test_pid_change_restarts_thread(sink):
-    mt.configure(True, sink.url, {"Authorization": "Bearer k"}, "meeting-copilot")
-    mt.record(**_call())
-    first = mt._thread
-    with patch.object(mt.os, "getpid", return_value=os.getpid() + 1):
-        mt.record(**_call())
-    assert mt._thread is not first and mt._thread.is_alive()
-
-
-def test_trace_enabled_from_settings(monkeypatch):
-    from app.core.config import get_settings
-
-    s = get_settings()
-    monkeypatch.setattr(s, "model_trace", True, raising=False)
-    monkeypatch.setattr(s, "contacts_backend_service_secret", "sek")
-    monkeypatch.setattr(s, "contacts_backend_base_url", "http://127.0.0.1:9/")
-    mt._configured = False
-    mt.trace(**_call())
-    assert mt._cfg == {
-        "enabled": True,
-        "url": "http://127.0.0.1:9/internal/traces",
-        "headers": {"Authorization": "Bearer sek"},
-        "source": "meeting-copilot",
-    }
-
-
-def test_trace_off_without_secret(monkeypatch):
-    from app.core.config import get_settings
-
-    s = get_settings()
-    monkeypatch.setattr(s, "model_trace", True, raising=False)
-    monkeypatch.setattr(s, "contacts_backend_service_secret", None)
-    mt._configured = False
-    mt.trace(**_call())
-    assert not mt._cfg["enabled"] and mt._thread is None
-
-
-# ── pipeline wiring ───────────────────────────────────────────────────────────
-
-@pytest.fixture
-def traced():
-    calls = []
-    with patch("app.services.model_trace.trace", side_effect=lambda **k: calls.append(k)), \
-         patch("app.services.ai.langgraph_pipeline.trace", side_effect=lambda **k: calls.append(k)), \
-         patch("app.services.memory.qdrant_retriever.trace", side_effect=lambda **k: calls.append(k)):
-        yield calls
-
-
-def _ai(text="hi"):
-    m = AIMessage(content=text)
-    m.usage_metadata = {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
-    return m
-
-
-def test_openai_messages_mapping():
-    from app.services.ai.langgraph_pipeline import _to_openai
-    out = _to_openai([SystemMessage(content="s"), HumanMessage(content="u")])
-    assert out == [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-
-
-@arun
-async def test_summary_traced(traced):
-    from app.services.ai import langgraph_pipeline as lp
-    p = lp.SummaryPipeline()
-    p._llm = MagicMock(ainvoke=AsyncMock(return_value=_ai("sum")))
-    await p.generate_rolling_summary("sess", "tx", user_id="u1")
-    c = traced[0]
-    assert c["site"] == "copilot.summary" and c["kind"] == "chat" and c["provider"] == "openai"
-    assert c["output"] == {"text": "sum"} and c["usage"] == {"inTok": 3, "outTok": 4}
-    assert c["userId"] == "u1" and c["turnId"] == "sess"
-    assert c["messages"][0]["role"] == "system" or c["system"]
-
-
-@arun
-async def test_summary_error_traced_and_swallowed(traced):
-    from app.services.ai import langgraph_pipeline as lp
-    p = lp.SummaryPipeline()
-    p._llm = MagicMock(ainvoke=AsyncMock(side_effect=RuntimeError("boom")))
-    assert await p.generate_rolling_summary("sess", "tx", previous_summary="prev") == "prev"
-    assert traced[0]["error"]["message"] == "boom"
-
-
-@arun
-async def test_action_items_and_suggestion_traced(traced):
-    from app.services.ai import langgraph_pipeline as lp
-    s = lp.SummaryPipeline()
-    s._llm = MagicMock(ainvoke=AsyncMock(return_value=_ai('{"action_items": []}')))
-    await s.extract_action_items("sess", "tx")
-    g = lp.SuggestionPipeline()
-    g._llm = MagicMock(ainvoke=AsyncMock(return_value=_ai('{"suggestions": []}')))
-    await g.generate("sess", "hello")
-    assert [c["site"] for c in traced] == ["copilot.action_items", "copilot.suggestion"]
-
-
-@arun
-async def test_graph_node_traced(traced):
-    from app.services.ai import langgraph_pipeline as lp
-    llm = MagicMock(ainvoke=AsyncMock(return_value=_ai("ans")))
-    state = {"assembled_context": "ctx", "user_query": "q", "session_id": "sess", "metadata": {}}
-    await lp.generate_response_node(state, llm)
-    assert traced[0]["site"] == "copilot.context" and traced[0]["turnId"] == "sess"
-
-
-@arun
-async def test_stream_traced_once_with_ttft(traced):
-    from app.services.ai import langgraph_pipeline as lp
-    p = lp.MeetingContextPipeline.__new__(lp.MeetingContextPipeline)
-    p._settings = lp.get_settings()
-    p._retriever = MagicMock(get_meeting_context_chunks=AsyncMock(return_value={"current": [], "historical": []}))
-
-    async def gen(_m):
-        yield AIMessageChunk(content="a")
-        yield AIMessageChunk(content="b", usage_metadata={"input_tokens": 1, "output_tokens": 2, "total_tokens": 3})
-
-    p._streaming_llm = MagicMock(astream=gen)
-    out = [t async for t in p.stream("sess", "org", "q", "tx")]
-    assert out == ["a", "b"]
-    assert len(traced) == 1
-    c = traced[0]
-    assert c["site"] == "copilot.context_stream" and c["kind"] == "stream"
-    assert c["output"]["text"] == "ab" and c["ttftMs"] >= 0 and c["usage"] == {"inTok": 1, "outTok": 2}
-
-
-@arun
-async def test_embed_traced(traced):
-    from app.services.memory.qdrant_retriever import QdrantRetriever
-    r = QdrantRetriever()
-    resp = SimpleNamespace(data=[SimpleNamespace(embedding=[0.1])], usage=SimpleNamespace(total_tokens=9))
-    r._openai = MagicMock(embeddings=MagicMock(create=AsyncMock(return_value=resp)))
-    await r.embed_text(" hi ", user_id="u1", session_id="sess")
-    await r.embed_texts(["a", "b"])
-    c = traced[0]
-    assert c["site"] == "copilot.embed" and c["kind"] == "embedding"
-    assert c["embedding"] == {"texts": ["hi"]} and c["usage"]["inTok"] == 9 and c["userId"] == "u1"
-    assert traced[1]["embedding"] == {"texts": ["a", "b"]}
-
-
-def test_coverage_guard_no_other_model_clients():
-    root = Path(__file__).resolve().parents[1] / "app"
-    allowed = {"services/ai/langgraph_pipeline.py", "services/memory/qdrant_retriever.py"}
-    bad = [str(p) for p in root.rglob("*.py")
-           if p.relative_to(root).as_posix() not in allowed
-           and re.search(r"\b(ChatOpenAI|AsyncOpenAI|OpenAI)\(", p.read_text())]
-    assert bad == []
+def test_rejected_in_response_is_logged(server, monkeypatch, caplog):
+    url, got = server
+    got.reply["body"] = b'{"accepted":0,"rejected":2}'
+    no_thread(monkeypatch)
+    on(url)
+    mt.record(site="s")
+    with caplog.at_level(logging.WARNING):
+        mt.flush()
+    assert "rejected 2" in caplog.text

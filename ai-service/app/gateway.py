@@ -36,6 +36,7 @@ from app.services.ai.langgraph_pipeline import (
 )
 from app.services.memory.qdrant_retriever import qdrant_retriever
 from app.services.ocr.screen_ocr import screen_ocr_pipeline
+from app.services.trace_setup import configure_tracing
 from app.services.usage_client import record_usage
 from app.services.transcription.deepgram_service import (
     DeepgramStreamingService,
@@ -951,6 +952,7 @@ async def health_check() -> HealthResponse:
 
 @app.on_event("startup")
 async def startup() -> None:
+    configure_tracing()
     await qdrant_retriever.ensure_collections()
     logger.info("realtime_gateway_started")
 

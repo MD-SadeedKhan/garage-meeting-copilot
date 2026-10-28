@@ -16,7 +16,7 @@ from langgraph.graph import END, START, StateGraph
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.services.memory.qdrant_retriever import QdrantRetriever
-from app.services.model_trace import trace
+from app.services.model_trace import record
 from app.services.usage_client import record_usage
 
 logger = get_logger(__name__)
@@ -77,6 +77,7 @@ def _trace_chat(
     usage: dict | None = None,
     error: Exception | None = None,
     ttft_ms: int | None = None,
+    finish_reason: str | None = None,
 ) -> None:
     """Send one model call to contacts-backend's trace store. Never raises."""
     try:
@@ -89,14 +90,16 @@ def _trace_chat(
                 params[dst] = v
         if text is None and response is not None:
             text = response.content if isinstance(response.content, str) else str(response.content)
-        trace(
+        record(
             site=site,
             kind="stream" if site.endswith("_stream") else "chat",
             provider="openai",
             model=model,
             messages=_to_openai(messages),
             params=params or None,
-            output={"text": text} if text is not None else None,
+            output=(
+                {"text": text, "finishReason": finish_reason} if finish_reason else {"text": text}
+            ) if text is not None else None,
             usage=(
                 {"inTok": usage.get("input_tokens", 0), "outTok": usage.get("output_tokens", 0)}
                 if usage
@@ -558,6 +561,7 @@ class MeetingContextPipeline:
         ttft_ms: int | None = None
         text_parts: list[str] = []
         model = self._settings.openai_llm_model
+        completed, err = False, None
         try:
             async for chunk in self._streaming_llm.astream(messages):
                 agg = chunk if agg is None else agg + chunk
@@ -566,14 +570,17 @@ class MeetingContextPipeline:
                         ttft_ms = int((time.monotonic() - started) * 1000)
                     text_parts.append(chunk.content)
                     yield chunk.content
+            completed = True
         except Exception as e:
+            err = e
+            raise
+        finally:
+            # Not completed = consumer closed us (GeneratorExit/CancelledError) or an error:
+            # keep the partial text, marked aborted.
             _trace_chat("copilot.context_stream", self._streaming_llm, messages, model=model,
                         started=started, session_id=session_id, user_id=user_id,
-                        text="".join(text_parts), error=e, ttft_ms=ttft_ms)
-            raise
-        _trace_chat("copilot.context_stream", self._streaming_llm, messages, model=model,
-                    started=started, session_id=session_id, user_id=user_id,
-                    text="".join(text_parts), response=agg, ttft_ms=ttft_ms)
+                        text="".join(text_parts), response=agg if completed else None, error=err,
+                        ttft_ms=ttft_ms, finish_reason=None if completed else "aborted")
 
         if agg is not None:
             _emit_chat_usage(

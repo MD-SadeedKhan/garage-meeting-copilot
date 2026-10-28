@@ -17,7 +17,7 @@ import asyncio
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.services.model_trace import trace
+from app.services.model_trace import record
 from app.services.usage_client import record_usage
 
 logger = get_logger(__name__)
@@ -73,7 +73,7 @@ async def _embed(
         try:
             usage = getattr(response, "usage", None)
             tokens = getattr(usage, "total_tokens", None)
-            trace(
+            record(
                 site="copilot.embed",
                 kind="embedding",
                 provider="deploymachine" if s.embedding_base_url else "openai",
