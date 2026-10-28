@@ -4,6 +4,7 @@ Semantic embedding storage and retrieval for meeting memory.
 """
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 
@@ -16,6 +17,7 @@ import asyncio
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.services.model_trace import trace
 from app.services.usage_client import record_usage
 
 logger = get_logger(__name__)
@@ -45,6 +47,46 @@ def _emit_embedding_usage(
             ref_id=session_id,
         )
     )
+
+
+async def _embed(
+    openai: Any,
+    texts: list[str] | str,
+    *,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> Any:
+    """embeddings.create + a trace of the call (success or error). Re-raises as before."""
+    s = get_settings()
+    started = time.monotonic()
+    err: Exception | None = None
+    response = None
+    try:
+        response = await openai.embeddings.create(
+            model=s.openai_embedding_model, input=texts, encoding_format="float"
+        )
+        return response
+    except Exception as e:
+        err = e
+        raise
+    finally:
+        try:
+            usage = getattr(response, "usage", None)
+            tokens = getattr(usage, "total_tokens", None)
+            trace(
+                site="copilot.embed",
+                kind="embedding",
+                provider="deploymachine" if s.embedding_base_url else "openai",
+                model=s.openai_embedding_model,
+                embedding={"texts": [texts] if isinstance(texts, str) else list(texts)},
+                usage={"inTok": tokens, "outTok": 0} if isinstance(tokens, int) else None,
+                latencyMs=int((time.monotonic() - started) * 1000),
+                error={"message": str(err)[:2000]} if err else None,
+                userId=user_id,
+                turnId=session_id,
+            )
+        except Exception:  # noqa: BLE001 — tracing must not break a call
+            pass
 
 
 class QdrantRetriever:
@@ -121,10 +163,8 @@ class QdrantRetriever:
     ) -> list[float]:
         """Embed one text with the configured model."""
         openai = self._get_openai()
-        response = await openai.embeddings.create(
-            model=self._settings.openai_embedding_model,
-            input=text.strip(),
-            encoding_format="float",
+        response = await _embed(
+            openai, text.strip(), user_id=user_id, session_id=session_id
         )
         _emit_embedding_usage(
             response,
@@ -137,11 +177,7 @@ class QdrantRetriever:
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Batch embed multiple texts."""
         openai = self._get_openai()
-        response = await openai.embeddings.create(
-            model=self._settings.openai_embedding_model,
-            input=[t.strip() for t in texts],
-            encoding_format="float",
-        )
+        response = await _embed(openai, [t.strip() for t in texts])
         return [item.embedding for item in response.data]
 
     async def embed_query(self, query: str, task: str) -> list[float]:

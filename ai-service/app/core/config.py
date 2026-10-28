@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # contacts-backend's /internal/* endpoints (matches the backend's
     # OPENCLAW_NC_SERVICE_SECRET). Used by the usage-metering client.
     contacts_backend_service_secret: str | None = None
+    # MODEL_TRACE=1 sends every model call to contacts-backend
+    # `POST /internal/traces` (same URL + secret as above). Off by default.
+    model_trace: bool = False
     garage_jwt_secret: str = Field(..., min_length=16)
     garage_jwt_algorithm: str = "HS256"
     garage_jwt_audience: str | None = None

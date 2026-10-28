@@ -9,12 +9,14 @@ import time
 from typing import Any, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages.utils import convert_to_openai_messages
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.services.memory.qdrant_retriever import QdrantRetriever
+from app.services.model_trace import trace
 from app.services.usage_client import record_usage
 
 logger = get_logger(__name__)
@@ -52,6 +54,84 @@ def _emit_chat_usage(
             ref_id=session_id,
         )
     )
+
+
+def _to_openai(messages: list) -> list[dict[str, Any]]:
+    try:
+        return convert_to_openai_messages(messages)
+    except Exception:  # noqa: BLE001 — tracing must not break a call
+        return []
+
+
+def _trace_chat(
+    site: str,
+    llm: Any,
+    messages: list,
+    *,
+    model: str,
+    started: float,
+    session_id: str | None,
+    user_id: str | None,
+    response: Any = None,
+    text: str | None = None,
+    usage: dict | None = None,
+    error: Exception | None = None,
+    ttft_ms: int | None = None,
+) -> None:
+    """Send one model call to contacts-backend's trace store. Never raises."""
+    try:
+        if usage is None:
+            usage = getattr(response, "usage_metadata", None) or None
+        params: dict[str, Any] = {}
+        for src, dst in (("temperature", "temperature"), ("max_tokens", "maxTokens")):
+            v = getattr(llm, src, None)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                params[dst] = v
+        if text is None and response is not None:
+            text = response.content if isinstance(response.content, str) else str(response.content)
+        trace(
+            site=site,
+            kind="stream" if site.endswith("_stream") else "chat",
+            provider="openai",
+            model=model,
+            messages=_to_openai(messages),
+            params=params or None,
+            output={"text": text} if text is not None else None,
+            usage=(
+                {"inTok": usage.get("input_tokens", 0), "outTok": usage.get("output_tokens", 0)}
+                if usage
+                else None
+            ),
+            latencyMs=int((time.monotonic() - started) * 1000),
+            ttftMs=ttft_ms,
+            error={"message": str(error)[:2000]} if error else None,
+            userId=user_id,
+            turnId=session_id,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _invoke(
+    llm: Any,
+    messages: list,
+    *,
+    site: str,
+    model: str,
+    session_id: str | None,
+    user_id: str | None = None,
+) -> AIMessage:
+    """llm.ainvoke + a trace of the call (success or error). Re-raises as before."""
+    started = time.monotonic()
+    try:
+        response = await llm.ainvoke(messages)
+    except Exception as e:
+        _trace_chat(site, llm, messages, model=model, started=started,
+                    session_id=session_id, user_id=user_id, error=e)
+        raise
+    _trace_chat(site, llm, messages, model=model, started=started,
+                session_id=session_id, user_id=user_id, response=response)
+    return response
 
 
 # ── State Definitions ─────────────────────────────────────────────────────────
@@ -319,7 +399,12 @@ async def generate_response_node(
         ),
     ]
 
-    response = await llm.ainvoke(messages)
+    model = getattr(llm, "model_name", None)
+    response = await _invoke(
+        llm, messages, site="copilot.context",
+        model=model if isinstance(model, str) else get_settings().openai_llm_model,
+        session_id=state.get("session_id"),
+    )
     latency_ms = int((time.monotonic() - start) * 1000)
 
     return {
@@ -469,10 +554,26 @@ class MeetingContextPipeline:
         # Aggregate chunks so the trailing usage_metadata chunk (emitted
         # because stream_usage=True) can be metered after the stream ends.
         agg: AIMessage | None = None
-        async for chunk in self._streaming_llm.astream(messages):
-            agg = chunk if agg is None else agg + chunk
-            if chunk.content:
-                yield chunk.content
+        started = time.monotonic()
+        ttft_ms: int | None = None
+        text_parts: list[str] = []
+        model = self._settings.openai_llm_model
+        try:
+            async for chunk in self._streaming_llm.astream(messages):
+                agg = chunk if agg is None else agg + chunk
+                if chunk.content:
+                    if ttft_ms is None:
+                        ttft_ms = int((time.monotonic() - started) * 1000)
+                    text_parts.append(chunk.content)
+                    yield chunk.content
+        except Exception as e:
+            _trace_chat("copilot.context_stream", self._streaming_llm, messages, model=model,
+                        started=started, session_id=session_id, user_id=user_id,
+                        text="".join(text_parts), error=e, ttft_ms=ttft_ms)
+            raise
+        _trace_chat("copilot.context_stream", self._streaming_llm, messages, model=model,
+                    started=started, session_id=session_id, user_id=user_id,
+                    text="".join(text_parts), response=agg, ttft_ms=ttft_ms)
 
         if agg is not None:
             _emit_chat_usage(
@@ -550,7 +651,11 @@ class SuggestionPipeline:
         ]
 
         try:
-            response = await self._llm.ainvoke(messages)
+            response = await _invoke(
+                self._llm, messages, site="copilot.suggestion",
+                model=self._settings.openai_suggestion_model,
+                session_id=session_id, user_id=user_id,
+            )
             _emit_chat_usage(
                 response,
                 model=self._settings.openai_suggestion_model,
@@ -599,7 +704,11 @@ class SummaryPipeline:
         ]
 
         try:
-            response = await self._llm.ainvoke(messages)
+            response = await _invoke(
+                self._llm, messages, site="copilot.summary",
+                model=self._settings.openai_llm_model,
+                session_id=session_id, user_id=user_id,
+            )
             _emit_chat_usage(
                 response,
                 model=self._settings.openai_llm_model,
@@ -631,7 +740,11 @@ class SummaryPipeline:
         ]
 
         try:
-            response = await self._llm.ainvoke(messages)
+            response = await _invoke(
+                self._llm, messages, site="copilot.action_items",
+                model=self._settings.openai_llm_model,
+                session_id=session_id, user_id=user_id,
+            )
             _emit_chat_usage(
                 response,
                 model=self._settings.openai_llm_model,
