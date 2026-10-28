@@ -162,6 +162,18 @@ def test_queue_bounded_drops_oldest(monkeypatch):
     assert len(mt._q) == 500 and mt.dropped() == 10 and json.loads(mt._q[0])["n"] == 10
 
 
+def test_queue_bounded_by_total_bytes_drops_oldest(monkeypatch):
+    no_thread(monkeypatch)
+    on("http://127.0.0.1:9/x")
+    big = "x" * 5_000_000  # ~5 MB per call, under the 6 MB single-call cap
+    for i in range(12):
+        mt.record(site="s", n=i, system=big)
+    assert sum(len(b) for b in mt._q) <= 50_000_000
+    assert mt.dropped() == 12 - len(mt._q) and json.loads(mt._q[-1])["n"] == 11
+    mt._drain()  # draining keeps the byte count honest
+    assert mt._qbytes == 0
+
+
 def test_fork_child_hook_resets_state():
     on("http://127.0.0.1:9/nope")
     mt.record(site="s")

@@ -23,9 +23,11 @@ logger = logging.getLogger(__name__)
 _MAX_QUEUE, _BATCH, _TIMEOUT, _WAKE_EVERY, _WAKE_AT = 500, 50, 5, 2, 20
 _MAX_BATCH_BYTES = 6_000_000  # per POST (backend limit is 8mb); also the cap for one call
 _MAX_EMBED_CHARS = 1_000_000
+_MAX_QUEUE_BYTES = 50_000_000  # total queued; oldest dropped first, so a backend outage can't grow memory
 
 _cfg: dict = {"enabled": False, "url": "", "headers": {}, "source": ""}
-_q: collections.deque = collections.deque(maxlen=_MAX_QUEUE)  # encoded calls (bytes)
+_q: collections.deque = collections.deque()  # encoded calls (bytes); bounded by count AND bytes in record()
+_qbytes = 0
 _dropped = 0
 _lock = threading.Lock()
 _wake = threading.Event()
@@ -49,8 +51,8 @@ def dropped() -> int:
 
 
 def _reset_state() -> None:
-    global _q, _lock, _wake, _thread, _pid
-    _q = collections.deque(maxlen=_MAX_QUEUE)
+    global _q, _qbytes, _lock, _wake, _thread, _pid
+    _q, _qbytes = collections.deque(), 0
     _lock, _wake = threading.Lock(), threading.Event()
     _thread, _pid = None, 0
 
@@ -98,11 +100,13 @@ def _loop(wake: threading.Event) -> None:
 
 
 def _drain(deadline: float | None = None) -> None:
+    global _qbytes
     while deadline is None or time.monotonic() < deadline:
         batch, size = [], 0
         with _lock:
             while _q and len(batch) < _BATCH and (not batch or size + len(_q[0]) + 1 <= _MAX_BATCH_BYTES):
                 b = _q.popleft()
+                _qbytes -= len(b)
                 batch.append(b)
                 size += len(b) + 1
         if not batch:
@@ -155,7 +159,7 @@ def _cap_embedding(call: dict) -> None:
 
 def record(**call_fields) -> None:
     """Queue one call (wire-format field names). Never raises."""
-    global _dropped
+    global _dropped, _qbytes
     try:
         if not _cfg["enabled"]:
             return
@@ -172,9 +176,11 @@ def record(**call_fields) -> None:
             return
         _ensure_thread()
         with _lock:
-            if len(_q) == _q.maxlen:
+            while _q and (len(_q) >= _MAX_QUEUE or _qbytes + len(b) > _MAX_QUEUE_BYTES):
+                _qbytes -= len(_q.popleft())
                 _dropped += 1
             _q.append(b)
+            _qbytes += len(b)
             full = len(_q) >= _WAKE_AT
         if full:
             _wake.set()
