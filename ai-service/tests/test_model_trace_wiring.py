@@ -188,3 +188,15 @@ def test_configure_tracing_from_settings(monkeypatch):
     monkeypatch.setattr(s, "contacts_backend_service_secret", None)
     configure_tracing()
     assert not mt._cfg["enabled"]
+
+
+def test_tracing_on_by_default_and_model_trace_0_turns_it_off(monkeypatch):
+    from app.core.config import Settings, get_settings
+    from app.services.trace_setup import configure_tracing
+
+    assert Settings.model_fields["model_trace"].default == "1"
+    s = get_settings()
+    monkeypatch.setattr(s, "contacts_backend_service_secret", "sek")
+    monkeypatch.setattr(s, "model_trace", "0", raising=False)
+    configure_tracing()
+    assert not mt._cfg["enabled"]
